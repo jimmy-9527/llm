@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 import random
 import time
 from dataclasses import dataclass
@@ -22,6 +23,7 @@ from math_baseline import evaluate_vllm
 
 
 def init_vllm(model_id: str, device: str, seed: int, gpu_memory_utilization: float = 0.85) -> LLM:
+    os.environ["HF_HUB_OFFLINE"] = "1"
     vllm_set_random_seed(seed)
     world_size_patch = patch("torch.distributed.get_world_size", return_value=1)
     profiling_patch = patch(
@@ -451,11 +453,12 @@ def main():
     )
 
     # init tokenizer/policy (HF) on train_device
-    tokenizer = AutoTokenizer.from_pretrained(args.model_id)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_id, local_files_only=True)
     policy = AutoModelForCausalLM.from_pretrained(
         args.model_id,
         torch_dtype=torch.bfloat16,
         attn_implementation="flash_attention_2",
+        local_files_only=True,
     ).to(args.train_device)
     policy.train()
 

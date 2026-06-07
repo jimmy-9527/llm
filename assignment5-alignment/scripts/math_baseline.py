@@ -10,7 +10,6 @@ from vllm import LLM, SamplingParams
 
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
 
-
 @dataclass
 class EvalRow:
     idx: int
@@ -144,6 +143,7 @@ def sample_examples(rows: List[EvalRow], category: str, k: int = 10) -> List[Eva
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="data/models/Qwen2.5-Math-1.5B")
+    ap.add_argument("--dtype", default="float16")
     ap.add_argument("--data", default="data/MATH/validation.jsonl")
     ap.add_argument("--prompt_file", default="cs336_alignment/prompts/r1_zero.prompt")
     ap.add_argument("--out_dir", default="runs/math_baseline")
@@ -188,9 +188,10 @@ def main():
         include_stop_str_in_output=True,
     )
 
+    model_path = str(Path(args.model).resolve()) if Path(args.model).exists() else args.model
     llm = LLM(
-        model=args.model,
-        dtype="bfloat16",
+        model=model_path,
+        dtype=args.dtype,
     )
 
     rows = evaluate_vllm(

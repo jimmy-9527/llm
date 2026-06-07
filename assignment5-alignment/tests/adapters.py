@@ -44,7 +44,7 @@ def run_compute_group_normalized_rewards(
     normalize_by_std: bool,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """
-    Compute rewards for each group of rollout responses, 
+    Compute rewards for each group of rollout responses,
     normalized by the group size.
 
     For more on GRPO, see:
@@ -52,15 +52,15 @@ def run_compute_group_normalized_rewards(
         DeepSeek-R1: https://arxiv.org/abs/2501.12948
 
     Args:
-        reward_fn: Callable[[str, str], dict[str, float]], 
-            scores the rollout responses against the ground truths, 
-            producing a dict with keys 
+        reward_fn: Callable[[str, str], dict[str, float]],
+            scores the rollout responses against the ground truths,
+            producing a dict with keys
             "reward", "format_reward", and "answer_reward".
-        rollout_responses: list[str], rollouts from the policy. 
-            The length of this list is 
+        rollout_responses: list[str], rollouts from the policy.
+            The length of this list is
             `rollout_batch_size = n_prompts_per_rollout_batch * group_size`.
-        repeated_ground_truths: list[str], the ground truths for the examples. 
-            The length of this list is `rollout_batch_size`, 
+        repeated_ground_truths: list[str], the ground truths for the examples.
+            The length of this list is `rollout_batch_size`,
             because the ground truth for each example is repeated `group_size` times.
         group_size: int, number of rollouts per group.
         advantage_eps: float, epsilon to avoid division by zero
@@ -70,15 +70,23 @@ def run_compute_group_normalized_rewards(
 
     Returns:
         tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
-            torch.Tensor of shape (rollout_batch_size,): 
+            torch.Tensor of shape (rollout_batch_size,):
                 group-normalized rewards for each rollout response.
-            torch.Tensor of shape (rollout_batch_size,): 
+            torch.Tensor of shape (rollout_batch_size,):
                 raw rewards for each rollout response.
             dict[str, float]: metadata for the rewards of the rollout batch.
                 You may choose what you wish to log here
                 (some statistics of the rewards, etc.).
     """
-    raise NotImplementedError
+    from cs336_alignment.grpo import compute_group_normalized_rewards
+    return compute_group_normalized_rewards(
+        reward_fn=reward_fn,
+        rollout_responses=rollout_responses,
+        repeated_ground_truths=repeated_ground_truths,
+        group_size=group_size,
+        advantage_eps=advantage_eps,
+        normalize_by_std=normalize_by_std,
+    )
 
 
 def run_compute_entropy(logits: torch.Tensor) -> torch.Tensor:
@@ -132,16 +140,20 @@ def run_compute_naive_policy_gradient_loss(
     """Compute policy gradient loss using either raw rewards or advantages.
 
     Args:
-        raw_rewards_or_advantages: torch.Tensor of shape (batch_size, 1): 
+        raw_rewards_or_advantages: torch.Tensor of shape (batch_size, 1):
             the raw rewards or advantages for each rollout response.
-        policy_log_probs: torch.Tensor of shape (batch_size, sequence_length): 
+        policy_log_probs: torch.Tensor of shape (batch_size, sequence_length):
             the log-probs of the policy.
 
     Returns:
-        torch.Tensor of shape (batch_size, sequence_length): 
+        torch.Tensor of shape (batch_size, sequence_length):
             the policy gradient per-token loss.
     """
-    raise NotImplementedError
+    from cs336_alignment.grpo import compute_naive_policy_gradient_loss
+    return compute_naive_policy_gradient_loss(
+        raw_rewards_or_advantages=raw_rewards_or_advantages,
+        policy_log_probs=policy_log_probs,
+    )
 
 
 def run_compute_grpo_clip_loss(
@@ -153,22 +165,28 @@ def run_compute_grpo_clip_loss(
     """Compute the GRPO-Clip loss.
 
     Args:
-        advantages: torch.Tensor of shape (batch_size, 1): 
+        advantages: torch.Tensor of shape (batch_size, 1):
             the advantages for each rollout response.
-        policy_log_probs: torch.Tensor of shape (batch_size, sequence_length): 
+        policy_log_probs: torch.Tensor of shape (batch_size, sequence_length):
             the log-probs of the policy.
-        old_log_probs: torch.Tensor of shape (batch_size, sequence_length): 
+        old_log_probs: torch.Tensor of shape (batch_size, sequence_length):
             the log-probs of the old policy.
         cliprange: float, the clip range for the ratio.
 
     Returns:
         tuple[torch.Tensor, dict[str, torch.Tensor]]:
-            torch.Tensor of shape (batch_size, sequence_length): 
+            torch.Tensor of shape (batch_size, sequence_length):
                 the GRPO-Clip per-token loss.
-            dict[str, torch.Tensor]: metadata for the GRPO-Clip loss 
+            dict[str, torch.Tensor]: metadata for the GRPO-Clip loss
                 (used to compute clip fraction).
     """
-    raise NotImplementedError
+    from cs336_alignment.grpo import compute_grpo_clip_loss
+    return compute_grpo_clip_loss(
+        advantages=advantages,
+        policy_log_probs=policy_log_probs,
+        old_log_probs=old_log_probs,
+        cliprange=cliprange,
+    )
 
 
 def run_compute_policy_gradient_loss(
@@ -182,7 +200,15 @@ def run_compute_policy_gradient_loss(
     """
     Wrapper that delegates to the appropriate policy gradient loss function above.
     """
-    raise NotImplementedError
+    from cs336_alignment.grpo import compute_policy_gradient_loss
+    return compute_policy_gradient_loss(
+        policy_log_probs=policy_log_probs,
+        loss_type=loss_type,
+        raw_rewards=raw_rewards,
+        advantages=advantages,
+        old_log_probs=old_log_probs,
+        cliprange=cliprange,
+    )
 
 
 def run_masked_mean(tensor: torch.Tensor, mask: torch.Tensor, dim: int | None = None) -> torch.Tensor:
@@ -201,7 +227,8 @@ def run_masked_mean(tensor: torch.Tensor, mask: torch.Tensor, dim: int | None = 
         torch.Tensor, the mean of the tensor along the specified
             dimension, considering only the elements with mask value 1.
     """
-    raise NotImplementedError
+    from cs336_alignment.grpo import masked_mean
+    return masked_mean(tensor=tensor, mask=mask, dim=dim)
 
 def run_sft_microbatch_train_step(
     policy_log_probs: torch.Tensor,
@@ -253,10 +280,20 @@ def run_grpo_microbatch_train_step(
             (as in Dr. GRPO).
 
     Returns:
-        tuple[torch.Tensor, dict[str, torch.Tensor]]: 
+        tuple[torch.Tensor, dict[str, torch.Tensor]]:
             the policy gradient loss and its metadata.
     """
-    raise NotImplementedError
+    from cs336_alignment.grpo import grpo_microbatch_train_step
+    return grpo_microbatch_train_step(
+        policy_log_probs=policy_log_probs,
+        response_mask=response_mask,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        loss_type=loss_type,
+        raw_rewards=raw_rewards,
+        advantages=advantages,
+        old_log_probs=old_log_probs,
+        cliprange=cliprange,
+    )
 
 
 def run_masked_normalize(
@@ -323,7 +360,45 @@ def get_packed_sft_dataset(
         "input_ids" contains the token IDs for the language modeling inputs, and "labels" contains
         the token IDs for the language modeling labels.
     """
-    raise NotImplementedError
+    import json
+    import random
+    from pathlib import Path
+    from torch.utils.data import Dataset as TorchDataset
+
+    template_path = Path(__file__).parent.parent / "cs336_alignment" / "prompts" / "alpaca_sft.prompt"
+    template = template_path.read_text().rstrip("\n")
+
+    with open(dataset_path) as f:
+        examples = [json.loads(line) for line in f]
+
+    if shuffle:
+        random.shuffle(examples)
+
+    all_tokens: list[int] = []
+    for ex in examples:
+        text = template.format(instruction=ex["prompt"], response=ex["response"])
+        ids = tokenizer.encode(text, add_special_tokens=True)
+        ids.append(tokenizer.eos_token_id)
+        all_tokens.extend(ids)
+
+    n_examples = (len(all_tokens) - 1) // seq_length
+
+    class PackedDataset(TorchDataset):
+        def __init__(self, tokens: list[int], seq_len: int, n: int):
+            self.tokens = tokens
+            self.seq_len = seq_len
+            self.n = n
+
+        def __len__(self):
+            return self.n
+
+        def __getitem__(self, idx):
+            start = idx * self.seq_len
+            input_ids = torch.tensor(self.tokens[start : start + self.seq_len], dtype=torch.long)
+            labels = torch.tensor(self.tokens[start + 1 : start + self.seq_len + 1], dtype=torch.long)
+            return {"input_ids": input_ids, "labels": labels}
+
+    return PackedDataset(all_tokens, seq_length, n_examples)
 
 
 def run_iterate_batches(
@@ -346,7 +421,8 @@ def run_iterate_batches(
     Returns:
         Iterable over batches, where each batch has size `batch_size`.
     """
-    raise NotImplementedError
+    from torch.utils.data import DataLoader
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
 
 
 def run_parse_mmlu_response(
@@ -372,7 +448,14 @@ def run_parse_mmlu_response(
         str (one of "A", "B", "C", or "D") if the model output can be parsed into a prediction,
         else None.
     """
-    raise NotImplementedError
+    import re
+    n_options = len(mmlu_example.get("options", []))
+    letters = [chr(ord("A") + i) for i in range(n_options)] if n_options else list("ABCD")
+    pattern = r"\b([" + "".join(letters) + r"])\b"
+    matches = re.findall(pattern, model_output)
+    if not matches:
+        return None
+    return matches[0]
 
 
 def run_parse_gsm8k_response(
@@ -389,7 +472,11 @@ def run_parse_gsm8k_response(
         str with the predicted numeric answer if the model output can be parsed into a prediction,
         else None.
     """
-    raise NotImplementedError
+    import re
+    matches = re.findall(r"\d+(?:\.\d+)?", model_output)
+    if not matches:
+        return None
+    return matches[-1]
 
 
 def run_compute_per_instance_dpo_loss(
@@ -424,4 +511,30 @@ def run_compute_per_instance_dpo_loss(
     Returns:
         torch.Tensor with the DPO loss for this example.
     """
-    raise NotImplementedError
+    import torch.nn.functional as F
+    from cs336_alignment.sft_utils import tokenize_prompt_and_output, get_response_log_probs
+
+    def _sequence_log_prob(model, prompt_str, response_str):
+        enc = tokenize_prompt_and_output(
+            prompt_strs=[prompt_str],
+            output_strs=[response_str],
+            tokenizer=tokenizer,
+        )
+        input_ids = enc["input_ids"]
+        labels = enc["labels"]
+        response_mask = enc["response_mask"]
+        out = get_response_log_probs(model=model, input_ids=input_ids, labels=labels, return_token_entropy=False)
+        log_probs = out["log_probs"]  # (1, T)
+        return (log_probs * response_mask.float()).sum()
+
+    log_pi_chosen = _sequence_log_prob(lm, prompt, response_chosen)
+    log_pi_rejected = _sequence_log_prob(lm, prompt, response_rejected)
+
+    with torch.no_grad():
+        log_ref_chosen = _sequence_log_prob(lm_ref, prompt, response_chosen)
+        log_ref_rejected = _sequence_log_prob(lm_ref, prompt, response_rejected)
+
+    log_ratio_chosen = log_pi_chosen - log_ref_chosen
+    log_ratio_rejected = log_pi_rejected - log_ref_rejected
+
+    return -F.logsigmoid(beta * (log_ratio_chosen - log_ratio_rejected))

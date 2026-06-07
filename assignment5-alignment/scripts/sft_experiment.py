@@ -1,4 +1,5 @@
 import argparse
+import gc
 import json
 import time
 from typing import Dict, Any
@@ -22,7 +23,7 @@ from vllm import LLM, SamplingParams
 from vllm.model_executor import set_random_seed as vllm_set_random_seed
 
 
-def init_vllm(model_id: str, device: str, seed: int, gpu_memory_utilization: float = 0.85):
+def init_vllm(model_id: str, device: str, seed: int, gpu_memory_utilization: float = 0.4):
     vllm_set_random_seed(seed)
     world_size_path = patch("torch.distributed.get_world_size", return_value=1)
     profiling_patch = patch(
@@ -33,8 +34,9 @@ def init_vllm(model_id: str, device: str, seed: int, gpu_memory_utilization: flo
         return LLM(
             model=model_id,
             device=device,
-            dtype=torch.bfloat16,
-            enable_prefix_caching=True,
+            dtype=torch.float16,
+            enable_prefix_caching=False,
+            enforce_eager=True,
             gpu_memory_utilization=gpu_memory_utilization,
         )
 
@@ -131,7 +133,7 @@ def main():
     ap.add_argument("--prompt_file", default="cs336_alignment/prompts/r1_zero.prompt")
 
     ap.add_argument("--train_device", default="cuda:0")
-    ap.add_argument("--vllm_device", default="cuda:1")
+    ap.add_argument("--vllm_device", default="cuda:0")
 
     ap.add_argument("--train_samples", type=int, default=0, help="0 means full dataset")
     ap.add_argument("--filter_correct", action="store_true")
@@ -144,6 +146,10 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out_dir", default="runs/sft_experiment")
     ap.add_argument("--eval_max_examples", type=int, default=500)
+    ap.add_argument("--normalize_constant", type=float, default=1.0)
+    ap.add_argument("--gpu_memory_utilization", type=float, default=0.4)
+    ap.add_argument("--eval_temperature", type=float, default=1.0)
+    ap.add_argument("--eval_max_tokens", type=int, default=1024)
     args = ap.parse_args()
 
     # logging
@@ -178,6 +184,13 @@ def main():
             else:
                 print(payload)    
 
+    # log full run config before anything else
+    log_event({
+        "type": "config",
+        "args": vars(args),
+        "msg": f"Config: {vars(args)}",
+    })
+
     # seed
     torch.manual_seed(args.seed)
     random.seed(args.seed)
@@ -187,21 +200,18 @@ def main():
     policy = AutoModelForCausalLM.from_pretrained(
         args.model_id,
         torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
     ).to(args.train_device)
+    policy.gradient_checkpointing_enable()
     policy.train()
-
-    # vLLM on eval device
-    llm = init_vllm(args.model_id, device=args.vllm_device, seed=args.seed)
 
     eval_prompts, eval_gts = build_math_val_prompts_and_gts(
         args.val_path, args.prompt_file, max_examples=args.eval_max_examples
     )
 
     eval_sampling_params = SamplingParams(
-        temperature=1.0,
+        temperature=args.eval_temperature,
         top_p=1.0,
-        max_tokens=1024,
+        max_tokens=args.eval_max_tokens,
         stop=["</answer>"],
         include_stop_str_in_output=True,
     )
@@ -223,7 +233,7 @@ def main():
         drop_last=True,
     )
 
-    opt = torch.optim.AdamW(policy.parameters(), lr=args.lr)
+    opt = torch.optim.AdamW(policy.parameters(), lr=args.lr, foreach=False)
 
     # training loop
     opt.zero_grad(set_to_none=True)
@@ -246,7 +256,7 @@ def main():
                 policy_log_probs=policy_log_probs,
                 response_mask=response_mask,
                 gradient_accumulation_steps=args.grad_acc_steps,
-                normalize_constant=1.0,
+                normalize_constant=args.normalize_constant,
             )
 
             # optimizer step each grad_acc_steps
@@ -262,6 +272,16 @@ def main():
             if step % args.eval_interval == 0:
                 policy.eval()
                 with torch.no_grad():
+                    # Free GPU memory so vLLM can load the model
+                    policy.to("cpu")
+                    for state in opt.state.values():
+                        for k, v in state.items():
+                            if isinstance(v, torch.Tensor):
+                                state[k] = v.cpu()
+                    gc.collect()
+                    torch.cuda.empty_cache()
+
+                    llm = init_vllm(args.model_id, device=args.vllm_device, seed=args.seed, gpu_memory_utilization=args.gpu_memory_utilization)
                     load_policy_into_vllm_instance(policy, llm)
                     rows = evaluate_vllm(
                         vllm_model=llm,
@@ -271,6 +291,16 @@ def main():
                         eval_sampling_params=eval_sampling_params,
                         request_batch_size=64,
                     )
+                    del llm
+                    gc.collect()
+                    torch.cuda.empty_cache()
+
+                    # Restore policy and optimizer to training device
+                    policy.to(args.train_device)
+                    for state in opt.state.values():
+                        for k, v in state.items():
+                            if isinstance(v, torch.Tensor):
+                                state[k] = v.to(args.train_device)
 
                 # generation log records
                 # gen_log = log_generations(

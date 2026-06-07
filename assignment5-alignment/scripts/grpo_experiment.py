@@ -196,7 +196,7 @@ def main(
 
     optimizer = torch.optim.AdamW(policy.parameters(), lr=learning_rate, weight_decay=0.0, betas=(0.9, 0.95))
 
-    llm = init_vllm(model_id=model_id, device="cuda:1", seed=seed, gpu_memory_utilization=gpu_memory_utilization)
+    llm = init_vllm(model_id=model_id, device="cuda:0", seed=seed, gpu_memory_utilization=gpu_memory_utilization)
 
     load_policy_into_vllm_instance(policy, llm)
 

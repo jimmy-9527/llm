@@ -4,6 +4,10 @@ import pickle
 from pathlib import Path
 from typing import TypeVar
 
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
+
 import numpy as np
 import pytest
 import torch
@@ -210,7 +214,7 @@ def output_strs():
 
 @pytest.fixture
 def model_id():
-    return "/data/a5-alignment/models/Qwen2.5-Math-1.5B"
+    return "/opt/dlami/nvme/git/2025/assignment5-alignment/data/models/Qwen2.5-Math-1.5B"
 
 
 @pytest.fixture
