@@ -12,14 +12,11 @@ EVAL_INTERVAL=200
 EVAL_MAX_EXAMPLES=500
 
 declare -a RUNS=(
-  "s128   --train_samples 128  --max_steps 2000 --eval_interval ${EVAL_INTERVAL} --eval_max_examples ${EVAL_MAX_EXAMPLES}"
-  "s256   --train_samples 256  --max_steps 2000 --eval_interval ${EVAL_INTERVAL} --eval_max_examples ${EVAL_MAX_EXAMPLES}"
-  "s512   --train_samples 512  --max_steps 2000 --eval_interval ${EVAL_INTERVAL} --eval_max_examples ${EVAL_MAX_EXAMPLES}"
   "s1024  --train_samples 1024 --max_steps 2000 --eval_interval ${EVAL_INTERVAL} --eval_max_examples ${EVAL_MAX_EXAMPLES}"
   "sfull  --train_samples 0    --max_steps 4000 --eval_interval ${EVAL_INTERVAL} --eval_max_examples ${EVAL_MAX_EXAMPLES}"
 )
 
-echo "=== Starting SFT sweep at $(date) ==="
+echo "=== Resuming SFT sweep (s1024 + sfull) at $(date) ==="
 echo "Logs will be saved to: ${LOG_DIR}"
 echo
 

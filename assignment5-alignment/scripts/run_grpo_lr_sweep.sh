@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+
 # ====== basic settings ======
 MODEL_ID="${MODEL_ID:-data/models/Qwen2.5-Math-1.5B}"
 TRAIN_PATH="${TRAIN_PATH:-data/MATH/train.jsonl}"

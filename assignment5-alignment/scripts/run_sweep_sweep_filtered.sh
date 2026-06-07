@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+
 LOG_DIR="logs/sft_experiment_filtered"
 mkdir -p "${LOG_DIR}"
 

@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+
 ROLLOUT_BS=256
 
 MODEL_ID="${MODEL_ID:-data/models/Qwen2.5-Math-1.5B}"
