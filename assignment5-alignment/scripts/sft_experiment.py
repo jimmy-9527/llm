@@ -23,7 +23,7 @@ from vllm import LLM, SamplingParams
 from vllm.model_executor import set_random_seed as vllm_set_random_seed
 
 
-def init_vllm(model_id: str, device: str, seed: int, gpu_memory_utilization: float = 0.4):
+def init_vllm(model_id: str, device: str, seed: int, gpu_memory_utilization: float = 0.85):
     vllm_set_random_seed(seed)
     world_size_path = patch("torch.distributed.get_world_size", return_value=1)
     profiling_patch = patch(

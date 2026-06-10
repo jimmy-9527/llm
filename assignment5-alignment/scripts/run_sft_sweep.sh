@@ -5,22 +5,34 @@ export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
 
-LOG_DIR="logs/sft_experiment"
+LOG_DIR="logs/ei_experiment"
 mkdir -p "${LOG_DIR}"
 
-EVAL_INTERVAL=200
+N_EI_STEPS=5
+G=4
+EPOCHS=1
 EVAL_MAX_EXAMPLES=500
+SAMPLING_MAX_TOKENS=1024
+SAMPLING_MIN_TOKENS=4
+SEED=0
+
+TRAIN_DEVICE="cuda:0"
+VLLM_DEVICE="cuda:0"
+VLLM_GPU_MEM=0.5
+DTYPE="float16"
+ATTN="sdpa"
 
 declare -a RUNS=(
-  "s128   --train_samples 128  --max_steps 2000 --eval_interval ${EVAL_INTERVAL} --eval_max_examples ${EVAL_MAX_EXAMPLES}"
-  "s256   --train_samples 256  --max_steps 2000 --eval_interval ${EVAL_INTERVAL} --eval_max_examples ${EVAL_MAX_EXAMPLES}"
-  "s512   --train_samples 512  --max_steps 2000 --eval_interval ${EVAL_INTERVAL} --eval_max_examples ${EVAL_MAX_EXAMPLES}"
-  "s1024  --train_samples 1024 --max_steps 2000 --eval_interval ${EVAL_INTERVAL} --eval_max_examples ${EVAL_MAX_EXAMPLES}"
-  "sfull  --train_samples 0    --max_steps 4000 --eval_interval ${EVAL_INTERVAL} --eval_max_examples ${EVAL_MAX_EXAMPLES}"
+  "d128   --D_i 128"
+  "d256   --D_i 256"
+  "d512   --D_i 512"
+  "d1024  --D_i 1024"
+  "dfull  --D_i 2048"
 )
 
-echo "=== Starting SFT sweep at $(date) ==="
-echo "Logs will be saved to: ${LOG_DIR}"
+echo "=== Starting EI sweep at $(date) ==="
+echo "Logs: ${LOG_DIR}"
+echo "n_ei_steps=${N_EI_STEPS}  G=${G}  epochs=${EPOCHS}  dtype=${DTYPE}  attn=${ATTN}"
 echo
 
 for item in "${RUNS[@]}"; do
@@ -31,16 +43,31 @@ for item in "${RUNS[@]}"; do
   log_file="${LOG_DIR}/${ts}_${name}.log"
 
   echo "=== Run: ${name} @ $(date) ==="
-  echo "Command: uv run python scripts/sft_experiment.py ${args}"
-  echo "Log: ${log_file}"
+  echo "CMD: uv run python scripts/expert_iteration_experiment.py ${args} ..."
+  echo "LOG: ${log_file}"
   echo
 
   set +e
   {
     echo "===== BEGIN ${name} $(date) ====="
-    echo "CMD: uv run python scripts/sft_experiment.py ${args}"
-    echo
-    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True uv run python scripts/sft_experiment.py ${args}
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True uv run python scripts/expert_iteration_experiment.py \
+      ${args} \
+      --n_ei_steps "${N_EI_STEPS}" \
+      --G "${G}" \
+      --epochs "${EPOCHS}" \
+      --eval_max_examples "${EVAL_MAX_EXAMPLES}" \
+      --sampling_max_tokens "${SAMPLING_MAX_TOKENS}" \
+      --sampling_min_tokens "${SAMPLING_MIN_TOKENS}" \
+      --seed "${SEED}" \
+      --train_device "${TRAIN_DEVICE}" \
+      --vllm_device "${VLLM_DEVICE}" \
+      --vllm_gpu_memory_utilization "${VLLM_GPU_MEM}" \
+      --dtype "${DTYPE}" \
+      --attn_implementation "${ATTN}" \
+      --micro_batch_size 1 \
+      --lr 2e-6 \
+      --offload_vllm \
+      --out_dir "runs/ei_experiment"
     exit_code=$?
     echo
     echo "EXIT_CODE: ${exit_code}"
@@ -51,15 +78,13 @@ for item in "${RUNS[@]}"; do
   set -e
 
   if [[ "${exit_code}" -ne 0 ]]; then
-    echo
-    echo "!!! Run ${name} failed with exit code ${exit_code}. Stopping sweep."
-    echo "See log: ${log_file}"
+    echo "!!! Run ${name} failed (exit ${exit_code}). Stopping sweep."
+    echo "See: ${log_file}"
     exit "${exit_code}"
   fi
 
-  echo
-  echo "=== Run ${name} finished successfully @ $(date) ==="
+  echo "=== Run ${name} DONE @ $(date) ==="
   echo
 done
 
-echo "=== All runs completed at $(date) ==="
+echo "=== All EI runs finished @ $(date) ==="

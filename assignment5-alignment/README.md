@@ -8,6 +8,78 @@ We include a supplemental (and completely optional) assignment on safety alignme
 If you see any issues with the assignment handout or code, please feel free to
 raise a GitHub issue or open a pull request with a fix.
 
+## Environment Setup
+
+### Prerequisites
+
+- NVIDIA GPU (tested on Tesla T4, 15 GB VRAM, Compute Capability 7.5)
+- CUDA driver installed (`nvidia-smi` should work)
+- Python 3.11–3.12
+
+### 1. Install uv
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+source $HOME/.local/bin/env
+```
+
+### 2. Persist CUDA_HOME
+
+`/usr/local/cuda` is the standard CUDA toolkit path on this instance:
+
+```bash
+echo 'export CUDA_HOME=/usr/local/cuda' >> ~/.bashrc
+echo 'export PATH=$CUDA_HOME/bin:$PATH' >> ~/.bashrc
+echo 'export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH' >> ~/.bashrc
+source ~/.bashrc
+```
+
+`flash-attn` requires `CUDA_HOME` to be set when compiling from source.
+
+### 3. Create the venv and install dependencies
+
+```bash
+uv sync
+```
+
+This creates `.venv/` and installs all dependencies from `pyproject.toml` / `uv.lock`,
+including `flash-attn==2.7.4.post1` (compiled from source).
+
+### 4. Download the base model
+
+```bash
+.venv/bin/python - <<'EOF'
+from huggingface_hub import snapshot_download
+snapshot_download(
+    repo_id="Qwen/Qwen2.5-Math-1.5B",
+    local_dir="data/models/Qwen2.5-Math-1.5B",
+)
+print("done")
+EOF
+```
+
+The model is saved to `data/models/Qwen2.5-Math-1.5B/` — the default path expected by
+all training scripts.
+
+### 5. Run a script
+
+```bash
+uv run python scripts/grpo_experiment.py
+```
+
+### Environment details (as of 2026-06-08)
+
+| Item | Value |
+|------|-------|
+| GPU | Tesla T4 |
+| VRAM | 15,360 MiB |
+| Compute Capability | 7.5 |
+| CUDA toolkit | 12.6 (`/usr/local/cuda`) |
+| PyTorch | 2.5.1+cu124 |
+| Python | 3.12 |
+
+---
+
 ## Setup
 
 As in previous assignments, we use `uv` to manage dependencies.

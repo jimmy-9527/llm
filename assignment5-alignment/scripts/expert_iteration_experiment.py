@@ -1,4 +1,5 @@
 import argparse
+import gc
 import json
 import os
 import random
@@ -22,7 +23,8 @@ from cs336_alignment.sft_utils import tokenize_prompt_and_output, get_response_l
 from math_baseline import evaluate_vllm
 
 
-def init_vllm(model_id: str, device: str, seed: int, gpu_memory_utilization: float = 0.85) -> LLM:
+def init_vllm(model_id: str, device: str, seed: int, gpu_memory_utilization: float = 0.85,
+              dtype: torch.dtype = torch.bfloat16) -> LLM:
     os.environ["HF_HUB_OFFLINE"] = "1"
     vllm_set_random_seed(seed)
     world_size_patch = patch("torch.distributed.get_world_size", return_value=1)
@@ -35,11 +37,20 @@ def init_vllm(model_id: str, device: str, seed: int, gpu_memory_utilization: flo
         return LLM(
             model=model_id,
             device=device,
-            dtype=torch.bfloat16,
+            dtype=dtype,
             enable_prefix_caching=True,
             gpu_memory_utilization=gpu_memory_utilization,
         )
     
+
+def free_vllm_memory() -> None:
+    """Call after setting llm = None to flush all vLLM GPU memory."""
+    from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
+    gc.collect()
+    cleanup_dist_env_and_memory()
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+
 
 def load_policy_into_vllm_instance(policy: torch.nn.Module, llm: LLM) -> None:
     state_dict = policy.state_dict()
@@ -262,7 +273,7 @@ def train_sft_on_items(
         collate_fn=lambda b: collate_fn(b, tokenizer),
     )
 
-    opt = torch.optim.AdamW(policy.parameters(), lr=lr)
+    opt = torch.optim.AdamW(policy.parameters(), lr=lr, foreach=False)
     policy.train()
 
     step = 0
@@ -418,6 +429,12 @@ def main():
     ap.add_argument("--eval_request_batch_size", type=int, default=64)
     ap.add_argument("--rollout_request_batch_size", type=int, default=32)
     ap.add_argument("--save_each_ei_step", action="store_true")
+    ap.add_argument("--vllm_gpu_memory_utilization", type=float, default=0.85)
+    ap.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16"])
+    ap.add_argument("--attn_implementation", default="flash_attention_2",
+                    choices=["flash_attention_2", "sdpa", "eager"])
+    # destroy vLLM before training and recreate after — needed when train and vllm share a GPU
+    ap.add_argument("--offload_vllm", action="store_true", default=False)
 
     args = ap.parse_args()
 
@@ -453,17 +470,20 @@ def main():
     )
 
     # init tokenizer/policy (HF) on train_device
+    torch_dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
     tokenizer = AutoTokenizer.from_pretrained(args.model_id, local_files_only=True)
     policy = AutoModelForCausalLM.from_pretrained(
         args.model_id,
-        torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
+        torch_dtype=torch_dtype,
+        attn_implementation=args.attn_implementation,
         local_files_only=True,
     ).to(args.train_device)
     policy.train()
 
     # init vLLM on vllm_device
-    llm = init_vllm(args.model_id, device=args.vllm_device, seed=args.seed)
+    llm = init_vllm(args.model_id, device=args.vllm_device, seed=args.seed,
+                    gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+                    dtype=torch_dtype)
 
     # sampling params for rollout (n=G)
     rollout_sampling_params = SamplingParams(
@@ -540,6 +560,16 @@ def main():
             }
         )
 
+        # free vLLM memory before training when sharing GPU
+        if args.offload_vllm:
+            log_event({"type": "vllm_offload", "ei_step": ei_step, "msg": f"[EI {ei_step}] destroying vLLM for training"})
+            llm.llm_engine.model_executor.shutdown()
+            llm = None  # release before gc so tensors can actually be freed
+            free_vllm_memory()
+            log_event({"type": "vllm_mem", "ei_step": ei_step,
+                       "gpu_allocated_gb": round(torch.cuda.memory_allocated() / 1024**3, 2),
+                       "msg": f"[EI {ei_step}] GPU after vLLM free: {torch.cuda.memory_allocated()/1024**3:.2f} GB"})
+
         # train SFT on kept items
         policy.train()
         train_summary = train_sft_on_items(
@@ -554,11 +584,18 @@ def main():
             max_train_steps=args.max_train_steps_per_ei,
             log_event=log_event,
             ei_step=ei_step,
-            train_log_interval_opt_steps=10,            
+            train_log_interval_opt_steps=10,
         )
         log_event({"type": "train_summary", "ei_step": ei_step, "summary": train_summary,
                    "msg": f"[EI {ei_step}] train summary: {train_summary}"})
-        
+
+        # recreate vLLM after training
+        if args.offload_vllm:
+            log_event({"type": "vllm_recreate", "ei_step": ei_step, "msg": f"[EI {ei_step}] recreating vLLM for eval"})
+            llm = init_vllm(args.model_id, device=args.vllm_device, seed=args.seed,
+                            gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+                            dtype=torch_dtype)
+
         # eval after EI step
         metrics = eval_policy_with_vllm(
             policy=policy,

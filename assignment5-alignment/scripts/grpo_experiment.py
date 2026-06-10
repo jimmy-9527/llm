@@ -1,4 +1,6 @@
+import gc
 import json
+import math
 import os
 import time
 import random
@@ -29,7 +31,7 @@ class LossType(str, Enum):
     grpo_no_clip = "grpo_no_clip"
 
 
-def init_vllm(model_id: str, device: str, seed: int, gpu_memory_utilization: float = 0.85):
+def init_vllm(model_id: str, device: str, seed: int, gpu_memory_utilization: float = 0.70):
     vllm_set_random_seed(seed)
     world_size_path = patch("torch.distributed.get_world_size", return_value=1)
     profiling_patch = patch(
@@ -40,10 +42,63 @@ def init_vllm(model_id: str, device: str, seed: int, gpu_memory_utilization: flo
         return LLM(
             model=model_id,
             device=device,
-            dtype=torch.bfloat16,
+            dtype=torch.float16,
             enable_prefix_caching=True,
             gpu_memory_utilization=gpu_memory_utilization,
+            enable_sleep_mode=True,
         )
+
+
+def chunked_adamw_step(optimizer: torch.optim.AdamW) -> None:
+    """
+    AdamW update one parameter at a time, keeping m/v states on CPU in fp32.
+    fp32 states are required: float16 cannot represent eps=1e-8 (underflows to 0),
+    causing 0/0=NaN when gradients are zero. CPU storage avoids loading all
+    optimizer states to GPU simultaneously (which would require 12+ GiB for
+    a 1.5B float16 model).
+    """
+    for group in optimizer.param_groups:
+        beta1, beta2 = group['betas']
+        lr = group['lr']
+        eps = group['eps']
+        weight_decay = group.get('weight_decay', 0.0)
+
+        for p in group['params']:
+            if p.grad is None:
+                continue
+            state = optimizer.state[p]
+            if len(state) == 0:
+                state['step'] = 0
+                # fp32 states on CPU: float16 eps=1e-8 underflows to 0 → NaN
+                state['exp_avg'] = torch.zeros(p.data.shape, dtype=torch.float32, device='cpu')
+                state['exp_avg_sq'] = torch.zeros(p.data.shape, dtype=torch.float32, device='cpu')
+
+            state['step'] += 1
+            step = state['step']
+
+            # Move fp32 states to GPU for computation
+            exp_avg = state['exp_avg'].to(p.device, non_blocking=False)
+            exp_avg_sq = state['exp_avg_sq'].to(p.device, non_blocking=False)
+
+            # Cast grad to fp32 so all moment updates are in fp32
+            grad = p.grad.data.float()
+            exp_avg.lerp_(grad, 1.0 - beta1)
+            exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
+
+            bias_correction1 = 1.0 - beta1 ** step
+            bias_correction2 = 1.0 - beta2 ** step
+            step_size = lr / bias_correction1
+            denom = (exp_avg_sq.sqrt() / math.sqrt(bias_correction2)).add_(eps)
+
+            if weight_decay != 0.0:
+                p.data.mul_(1.0 - lr * weight_decay)
+
+            # Compute update in fp32, cast to param dtype before applying
+            update = exp_avg / denom
+            p.data.add_(update.to(p.data.dtype), alpha=-step_size)
+
+            state['exp_avg'] = exp_avg.cpu()
+            state['exp_avg_sq'] = exp_avg_sq.cpu()
 
 
 def load_policy_into_vllm_instance(policy, llm: LLM):
@@ -191,14 +246,17 @@ def main(
 
     # -------- init models --------
     tokenizer = AutoTokenizer.from_pretrained(model_id)
-    policy = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.bfloat16).cuda()
+    policy = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.float16).cuda()
+    policy.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     policy.train()
 
     optimizer = torch.optim.AdamW(policy.parameters(), lr=learning_rate, weight_decay=0.0, betas=(0.9, 0.95))
 
     llm = init_vllm(model_id=model_id, device="cuda:0", seed=seed, gpu_memory_utilization=gpu_memory_utilization)
-
-    load_policy_into_vllm_instance(policy, llm)
+    # Sleep immediately so vLLM's model + KV cache don't compete with training memory.
+    # Each rollout will wake_up, sync weights, generate, then sleep again.
+    llm.sleep(level=1)
+    torch.cuda.empty_cache()
 
     # -------- training loop --------
     global_step = 0
@@ -213,6 +271,11 @@ def main(
         batch_gts_prompt = [train_gts[i] for i in idxs]
 
         # ========== 2) rollout via vLLM ==========
+        gc.collect()
+        torch.cuda.empty_cache()
+        print(f"[MEM] step={grpo_step} before wake_up: alloc={torch.cuda.memory_allocated()/2**30:.2f} GiB reserved={torch.cuda.memory_reserved()/2**30:.2f} GiB", flush=True)
+        llm.wake_up()
+        load_policy_into_vllm_instance(policy, llm)
         sp = SamplingParams(
             temperature=sampling_temperature,
             min_tokens=sampling_min_tokens,
@@ -221,6 +284,10 @@ def main(
             stop=[stop_at],
         )
         outs = llm.generate(batch_prompts, sp)
+        llm.sleep(level=1)
+        gc.collect()
+        torch.cuda.empty_cache()
+        print(f"[MEM] step={grpo_step} after rollout sleep: alloc={torch.cuda.memory_allocated()/2**30:.2f} GiB reserved={torch.cuda.memory_reserved()/2**30:.2f} GiB", flush=True)
 
         rollout_prompts = []
         rollout_responses = []
@@ -250,10 +317,11 @@ def main(
             output_strs=rollout_responses,
             tokenizer=tokenizer,
         )
-        # toks: input_ids, labels, response_mask
-        input_ids = toks["input_ids"].cuda()
-        labels = toks["labels"].cuda()
-        response_mask = toks["response_mask"].cuda()
+        # keep on CPU — full batch (256 × T_max) is too large to hold on GPU
+        # alongside the policy model and gradients; microbatches are moved to GPU below
+        input_ids = toks["input_ids"]
+        labels = toks["labels"]
+        response_mask = toks["response_mask"]
 
         # ========== 5) (optional) old_log_probs for off-policy grpo_clip ==========
         old_log_probs = None
@@ -262,25 +330,24 @@ def main(
             with torch.inference_mode():
                 scored_old = get_response_log_probs(
                     model=policy,
-                    input_ids=input_ids,
-                    labels=labels,
+                    input_ids=input_ids.cuda(),
+                    labels=labels.cuda(),
                     return_token_entropy=False,
                 )
-                old_log_probs = scored_old["log_probs"].detach()  # (B, T)
-                # disable gradients for old policy logprobs
+                old_log_probs = scored_old["log_probs"].detach().cpu()  # (B, T) keep on CPU
                 old_log_probs.requires_grad_(False)
-        
-        # ========== 6) gradient updates on this rollout batch ==========
-        perm = torch.randperm(rollout_batch_size, device=input_ids.device)
 
-        # move reward/advantage to GPU and reorder according to perm
-        advantages_gpu = advantages.cuda()[perm].unsqueeze(-1)      # (B, 1)
-        raw_rewards_gpu = raw_rewards.cuda()[perm].unsqueeze(-1)    # (B, 1)
+        # ========== 6) gradient updates on this rollout batch ==========
+        perm = torch.randperm(rollout_batch_size)  # CPU perm
+
+        # reorder on CPU; move rewards/advantages to GPU
+        advantages_gpu = advantages[perm].cuda().unsqueeze(-1)      # (B, 1)
+        raw_rewards_gpu = raw_rewards[perm].cuda().unsqueeze(-1)    # (B, 1)
         input_ids = input_ids[perm]
         labels = labels[perm]
         response_mask = response_mask[perm]
         if old_log_probs is not None:
-            old_log_probs = old_log_probs.cuda()[perm]
+            old_log_probs = old_log_probs[perm]
 
         # actual optimization
         policy.train()
@@ -307,12 +374,12 @@ def main(
                     ms = k * micro_train_batch_size
                     me = ms + micro_train_batch_size
 
-                    micro_input_ids = mb_input_ids[ms:me]
-                    micro_labels = mb_labels[ms:me]
-                    micro_mask = mb_mask[ms:me]
+                    micro_input_ids = mb_input_ids[ms:me].cuda()
+                    micro_labels = mb_labels[ms:me].cuda()
+                    micro_mask = mb_mask[ms:me].cuda()
                     micro_adv = mb_adv[ms:me]
                     micro_raw = mb_raw[ms:me]
-                    micro_old = mb_old[ms:me] if mb_old is not None else None
+                    micro_old = mb_old[ms:me].cuda() if mb_old is not None else None
 
                     scored = get_response_log_probs(
                         model=policy,
@@ -340,9 +407,14 @@ def main(
                     ent = masked_mean(token_entropy.detach(), micro_mask, dim=None)
                     entropies.append(float(ent.cpu()))
 
-                # gradient clipping + step
+                # gradient clipping + step (optimizer states kept on CPU between steps)
                 grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)
-                optimizer.step()
+                torch.cuda.empty_cache()
+                chunked_adamw_step(optimizer)
+                # Free gradients immediately — they cost 3 GiB and must be gone
+                # before the next llm.wake_up() which needs 8.91 GiB (3+3+8.91>14.56 GiB)
+                optimizer.zero_grad(set_to_none=True)
+                torch.cuda.empty_cache()
 
                 global_step += 1
 
@@ -368,7 +440,7 @@ def main(
 
                 # ===== periodic eval =====
                 if global_step % eval_interval == 0:
-                    # sync latest policy into vLLM before evaluation
+                    llm.wake_up()
                     load_policy_into_vllm_instance(policy, llm)
                     val_metrics = eval_rewards_with_vllm(
                         llm=llm,
@@ -381,6 +453,8 @@ def main(
                         max_tokens=sampling_max_tokens,
                         stop=[stop_at],
                     )
+                    llm.sleep(level=1)
+                    torch.cuda.empty_cache()
                     with open(log_path, "a", encoding="utf-8") as f:
                         f.write(json.dumps({"global_step": global_step, **val_metrics}) + "\n")
 
@@ -391,8 +465,6 @@ def main(
                     policy.save_pretrained(save_dir)
                     tokenizer.save_pretrained(save_dir)
 
-        # before next rollout: synchronize latest policy weights into vLLM
-        load_policy_into_vllm_instance(policy, llm)
 
 
 if __name__ == "__main__":

@@ -30,7 +30,7 @@ SAMPLING_TEMP="${SAMPLING_TEMP:-1.0}"
 SAMPLING_MIN_TOKENS="${SAMPLING_MIN_TOKENS:-4}"
 SAMPLING_MAX_TOKENS="${SAMPLING_MAX_TOKENS:-1024}"
 
-GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.85}"
+GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.70}"
 SEED="${SEED:-0}"
 
 LOSS_TYPE="${LOSS_TYPE:-reinforce_with_baseline}"
@@ -55,12 +55,15 @@ echo
 for lr in "${LRS[@]}"; do
   echo "---- Running lr=${lr} ----"
 
+  run_log_dir="${LOG_DIR}/lr_${lr}"
+  mkdir -p "${run_log_dir}"
+
   cmd=(uv run python scripts/grpo_experiment.py
     --model-id "${MODEL_ID}"
     --train-path "${TRAIN_PATH}"
     --val-path "${VAL_PATH}"
     --prompt-file "${PROMPT_FILE}"
-    --log-dir "${LOG_DIR}"
+    --log-dir "${run_log_dir}"
     --seed "${SEED}"
     --learning-rate "${lr}"
     --n-grpo-steps "${N_GRPO_STEPS}"
