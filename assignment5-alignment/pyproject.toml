@@ -28,6 +28,8 @@ include = ["cs336_alignment"]
 [tool.uv]
 package = true
 no-build-isolation-package = ["flash-attn"]
+python-preference = "managed"   # use uv's bundled Python, which ships with Python.h (needed by Triton)
+python-downloads = "automatic"  # download managed Python automatically if not already installed
 
 
 [tool.uv.sources]

@@ -1,4 +1,6 @@
 *.bin
+*.safetensors
+tokenizer.json
 models/
 data/
 
