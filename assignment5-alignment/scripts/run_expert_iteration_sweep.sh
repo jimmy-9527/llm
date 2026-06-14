@@ -16,8 +16,8 @@ SAMPLING_MAX_TOKENS=256
 SAMPLING_MIN_TOKENS=4
 SEED=0
 
-TRAIN_DEVICE="cuda:0"
-VLLM_DEVICE="cuda:1"
+TRAIN_DEVICE="cuda:2"
+VLLM_DEVICE="cuda:3"
 
 # ==========================
 # Sweep list
