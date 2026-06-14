@@ -14,12 +14,11 @@ from torch.utils.data import Dataset, DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from cs336_alignment.utils import (
-    evaluate_vllm, load_jsonl, summarize,
-    init_vllm, load_policy_into_vllm_instance, build_prompts_and_gts,
+    load_jsonl, init_vllm, build_prompts_and_gts,
     filter_correct_sft_samples, collate_fn, log_event,
+    eval_policy_with_vllm,
 )
-from cs336_alignment.sft_utils import get_response_log_probs, sft_microbatch_train_step, log_generations
-from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
+from cs336_alignment.sft_utils import get_response_log_probs, sft_microbatch_train_step
 
 from vllm import SamplingParams
 
@@ -157,41 +156,14 @@ def main():
 
             # periodic eval
             if step % args.eval_interval == 0:
-                policy.eval()
-                with torch.no_grad():
-                    load_policy_into_vllm_instance(policy, llm)
-                    rows = evaluate_vllm(
-                        vllm_model=llm,
-                        reward_fn=r1_zero_reward_fn,
-                        prompts=eval_prompts,
-                        ground_truths=eval_gts,
-                        eval_sampling_params=eval_sampling_params,
-                        request_batch_size=64,
-                    )
-
-                # generation log records
-                # gen_log = log_generations(
-                #     model=policy,
-                #     tokenizer=tokenizer,
-                #     prompts=eval_prompts[:8],
-                #     ground_truths=eval_gts[:8],
-                #     reward_fn=r1_zero_reward_fn,
-                #     num_log=8,
-                #     step=step,
-                #     stop_str="</answer>",
-                #     max_new_tokens=512,
-                #     temperature=0.0,
-                # )
-
-                # log_event({"type": "gen_stats", "gen_stats": gen_log["stats"], "msg": f"gen stats: {gen_log['stats']}"})
-
-                s = summarize(rows)
-                metrics = {
-                    "eval/accuracy": s["answer_accuracy"],
-                    "eval/format_rate": s["format_rate"],
-                    "eval/avg_reward": s["avg_reward"],
-                    "eval/n": s["n"],
-                }
+                metrics = eval_policy_with_vllm(
+                    policy=policy,
+                    llm=llm,
+                    eval_prompts=eval_prompts,
+                    eval_gts=eval_gts,
+                    eval_sampling_params=eval_sampling_params,
+                    request_batch_size=64,
+                )
                 log_event(log_path, step, micro_idx, opt_step, {"type": "eval_metrics", "loss": float(loss.detach()), "metrics": metrics,
                         "msg": f"[step={step}] loss={float(loss.detach()):.4f} {metrics}"})
                 policy.train()

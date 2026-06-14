@@ -1,8 +1,12 @@
+import os
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import argparse
 import json
 import random
 import time
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -11,82 +15,18 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from unittest.mock import patch
 from vllm import LLM, SamplingParams
-from vllm.model_executor import set_random_seed as vllm_set_random_seed
 
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
-from cs336_alignment.sft_utils import tokenize_prompt_and_output, get_response_log_probs, sft_microbatch_train_step
-
-from math_baseline import evaluate_vllm
-
-
-def init_vllm(model_id: str, device: str, seed: int, gpu_memory_utilization: float = 0.85) -> LLM:
-    vllm_set_random_seed(seed)
-    world_size_patch = patch("torch.distributed.get_world_size", return_value=1)
-    profiling_patch = patch(
-        "vllm.worker.worker.Worker._assert_memory_footprint_increased_during_profiling",
-        return_value=None,
-    )
-
-    with world_size_patch, profiling_patch:
-        return LLM(
-            model=model_id,
-            device=device,
-            dtype=torch.bfloat16,
-            enable_prefix_caching=True,
-            gpu_memory_utilization=gpu_memory_utilization,
-        )
-    
-
-def load_policy_into_vllm_instance(policy: torch.nn.Module, llm: LLM) -> None:
-    state_dict = policy.state_dict()
-    llm_model = llm.llm_engine.model_executor.driver_worker.model_runner.model
-    llm_model.load_weights(state_dict.items())
-
-
-def load_jsonl(path: str) -> List[Dict[str, Any]]:
-    data: List[Dict[str, Any]] = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                data.append(json.loads(line))
-    return data
-
-
-def load_prompt_template(prompt_file: str) -> str:
-    return Path(prompt_file).read_text(encoding="utf-8")
-
-
-def build_prompts_and_gts(
-    data: List[Dict[str, Any]],
-    prompt_template: str,
-    max_examples: int = 0,
-) -> Tuple[List[str], List[Any], List[str]]:
-    """
-    Returns:
-      prompts: list[str]
-      gts: list[Any]
-      uids: list[str]
-    Expects each example has: problem, answer, unique_id
-    """
-    if max_examples and max_examples > 0:
-        data = data[:max_examples]
-
-    prompts: List[str] = []
-    gts: List[Any] = []
-    uids: List[str] = []
-    for ex in data:
-        q = ex.get("problem")
-        gt = ex.get("answer")
-        uid = ex.get("unique_id", "")
-        if q is None or gt is None:
-            raise KeyError(f"Missing required fields in example: keys={list(ex.keys())}")
-        prompts.append(prompt_template.format(question=q))
-        gts.append(gt)
-        uids.append(uid)
-    return prompts, gts, uids
+from cs336_alignment.sft_utils import get_response_log_probs, sft_microbatch_train_step
+from cs336_alignment.utils import (
+    init_vllm,
+    load_policy_into_vllm_instance,
+    load_jsonl,
+    collate_fn,
+    build_prompts_and_gts,
+    eval_policy_with_vllm,
+)
 
 
 class EISFTDataset(Dataset):
@@ -103,13 +43,6 @@ class EISFTDataset(Dataset):
     def __getitem__(self, idx: int):
         ex = self.items[idx]
         return ex["prompt"], ex["response"], ex
-
-
-def collate_fn(batch, tokenizer):
-    prompts = [x[0] for x in batch]
-    outputs = [x[1] for x in batch]
-    toks = tokenize_prompt_and_output(prompts, outputs, tokenizer)
-    return toks
 
 
 def make_logger(log_path: Path):
@@ -131,19 +64,6 @@ def make_logger(log_path: Path):
                 print(payload)
 
     return log_event
-
-
-@dataclass
-class RolloutRecord:
-    ei_step: int
-    idx_in_batch: int
-    unique_id: str
-    prompt: str
-    response: str
-    answer: Any
-    reward: float
-    format_reward: float
-    answer_reward: float
 
 
 def rollout_and_filter_correct(
@@ -260,7 +180,7 @@ def train_sft_on_items(
         collate_fn=lambda b: collate_fn(b, tokenizer),
     )
 
-    opt = torch.optim.AdamW(policy.parameters(), lr=lr)
+    opt = torch.optim.AdamW(policy.parameters(), lr=lr, foreach=False, fused=False)
     policy.train()
 
     step = 0
@@ -344,34 +264,6 @@ def train_sft_on_items(
     }
 
 
-def eval_policy_with_vllm(
-    *,
-    policy: torch.nn.Module,
-    llm: LLM,
-    eval_prompts: List[str],
-    eval_gts: List[Any],
-    eval_sampling_params: SamplingParams,
-    request_batch_size: int,
-) -> Dict[str, Any]:
-    policy.eval()
-    with torch.no_grad():
-        load_policy_into_vllm_instance(policy, llm)
-        rows = evaluate_vllm(
-            vllm_model=llm,
-            reward_fn=r1_zero_reward_fn,
-            prompts=eval_prompts,
-            ground_truths=eval_gts,
-            eval_sampling_params=eval_sampling_params,
-            request_batch_size=request_batch_size,
-        )
-
-    n = len(rows)
-    acc = sum(r.answer_reward for r in rows) / n if n else 0.0
-    fmt = sum(r.format_reward for r in rows) / n if n else 0.0
-    rew = sum(r.reward for r in rows) / n if n else 0.0
-    return {"eval/n": n, "eval/accuracy": acc, "eval/format_rate": fmt, "eval/avg_reward": rew}
-
-
 def save_jsonl(items: List[Dict[str, Any]], path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
@@ -387,8 +279,8 @@ def main():
     ap.add_argument("--val_path", default="data/MATH/validation.jsonl")
     ap.add_argument("--prompt_file", default="cs336_alignment/prompts/r1_zero.prompt")
 
-    ap.add_argument("--train_device", default="cuda:0")
-    ap.add_argument("--vllm_device", default="cuda:1")
+    ap.add_argument("--train_device", default="cuda:2")
+    ap.add_argument("--vllm_device", default="cuda:3")
 
     ap.add_argument("--out_dir", default="runs/expert_iteration")
     ap.add_argument("--seed", type=int, default=0)
@@ -439,24 +331,23 @@ def main():
         }
     )
 
-    # load prompt template + data
-    prompt_template = load_prompt_template(args.prompt_file)
-
+    # load data
     train_data = load_jsonl(args.train_path)
     val_data = load_jsonl(args.val_path)
 
     # build eval prompts
-    eval_prompts, eval_gts, _ = build_prompts_and_gts(
-        val_data, prompt_template, max_examples=args.eval_max_examples
+    eval_prompts, eval_gts = build_prompts_and_gts(
+        val_data, args.prompt_file, max_examples=args.eval_max_examples
     )
 
     # init tokenizer/policy (HF) on train_device
     tokenizer = AutoTokenizer.from_pretrained(args.model_id)
     policy = AutoModelForCausalLM.from_pretrained(
         args.model_id,
-        torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
+        torch_dtype=torch.float16,
+        attn_implementation="sdpa",
     ).to(args.train_device)
+    policy.gradient_checkpointing_enable()
     policy.train()
 
     # init vLLM on vllm_device
@@ -504,7 +395,7 @@ def main():
         sampled = train_data[: args.D_i]
 
         batch_prompts, batch_gts, batch_uids = build_prompts_and_gts(
-            sampled, prompt_template, max_examples=0
+            sampled, args.prompt_file, return_uids=True
         )
 
         # load policy -> vLLM and rollout
@@ -586,8 +477,19 @@ def main():
     policy.save_pretrained(str(final_dir))
     tokenizer.save_pretrained(str(final_dir))
     log_event({"type": "save", "ei_step": args.n_ei_steps, "out_dir": str(final_dir),
-               "msg": f"Saved final model: {final_dir}"})    
+               "msg": f"Saved final model: {final_dir}"})
 
 
+# uv run python scripts/expert_iteration_experiment.py \
+#   --n_ei_steps 1 \
+#   --D_i 32 \
+#   --G 2 \
+#   --epochs 1 \
+#   --sampling_max_tokens 128 \
+#   --eval_max_examples 32 \
+#   --max_train_steps_per_ei 50 \
+#   --micro_batch_size 1 \
+#   --grad_acc_steps 2 \
+#   --save_each_ei_step
 if __name__ == "__main__":
     main()

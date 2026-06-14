@@ -15,12 +15,23 @@ from vllm import LLM, SamplingParams
 from vllm.model_executor import set_random_seed as vllm_set_random_seed
 from vllm.worker import worker as _vllm_worker_module
 
-# vLLM's UniProcExecutor hardcodes local_rank=0, so Worker.init_device calls
-# set_device(cuda:0) even when device_config targets a different GPU. xformers
-# then creates attn_bias on cuda:0 while Q/K/V are on the configured device.
-# Patch init_device once at import time to correct current_device() afterward.
+# vLLM's UniProcExecutor hardcodes local_rank=0, so Worker.init_device builds
+# its device as cuda:{local_rank}=cuda:0 even when device_config targets another
+# GPU. Two consequences:
+#   1. It captures its memory baseline snapshot on cuda:0. If cuda:0 is busy
+#      (e.g. another process), the baseline is wrong and vLLM derives a negative
+#      non_torch_memory, over-estimating KV-cache space and OOMing on the real
+#      device.
+#   2. xformers then creates attn_bias on cuda:0 while Q/K/V live on the
+#      configured device.
+# Fix by pointing local_rank at the configured device *before* init runs, so
+# device selection, the baseline snapshot, and the distributed group all use the
+# right GPU; the trailing set_device keeps current_device() consistent too.
 _orig_init_device = _vllm_worker_module.Worker.init_device
 def _patched_init_device(self):
+    target = self.device_config.device
+    if getattr(target, "type", None) == "cuda" and target.index is not None:
+        self.local_rank = target.index
     _orig_init_device(self)
     torch.cuda.set_device(self.device_config.device)
 _vllm_worker_module.Worker.init_device = _patched_init_device
@@ -77,19 +88,36 @@ def get_ground_truth(ex: Dict[str, Any]) -> Any:
 
 
 def build_prompts_and_gts(
-    data_path: str,
+    data,
     prompt_file: str,
     max_examples: int = 0,
+    return_uids: bool = False,
 ) -> tuple:
+    """
+    Build r1-zero prompts and ground truths from examples.
+
+    Args:
+      data: either a path to a .jsonl file, or an already-loaded list of example dicts.
+      prompt_file: path to the prompt template file.
+      max_examples: if > 0, truncate to the first N examples.
+      return_uids: if True, also return a list of each example's "unique_id".
+
+    Returns:
+      (prompts, gts) or, when return_uids is True, (prompts, gts, uids).
+    """
     prompt_template = read_text(prompt_file)
-    data = load_jsonl(data_path)
+    if isinstance(data, str):
+        data = load_jsonl(data)
     if max_examples and max_examples > 0:
         data = data[:max_examples]
 
-    prompts, gts = [], []
+    prompts, gts, uids = [], [], []
     for ex in data:
         prompts.append(format_r1_zero_prompt(prompt_template, get_question(ex)))
         gts.append(get_ground_truth(ex))
+        uids.append(ex.get("unique_id", ""))
+    if return_uids:
+        return prompts, gts, uids
     return prompts, gts
 
 
@@ -195,6 +223,43 @@ def summarize(rows: List[EvalRow]) -> Dict[str, Any]:
 
 def sample_examples(rows: List[EvalRow], category: str, k: int = 10) -> List[EvalRow]:
     return [r for r in rows if r.category == category][:k]
+
+
+def eval_policy_with_vllm(
+    *,
+    policy: torch.nn.Module,
+    llm: LLM,
+    eval_prompts: List[str],
+    eval_gts: List[Any],
+    eval_sampling_params: SamplingParams,
+    request_batch_size: int = 64,
+    reward_fn: Callable[[str, Any], Dict[str, float]] = r1_zero_reward_fn,
+) -> Dict[str, Any]:
+    """
+    Load the current policy weights into the vLLM instance, evaluate on the
+    given prompts, and return an eval/* metrics dict.
+
+    Leaves the policy in eval() mode; callers that resume training should call
+    policy.train() afterwards.
+    """
+    policy.eval()
+    with torch.no_grad():
+        load_policy_into_vllm_instance(policy, llm)
+        rows = evaluate_vllm(
+            vllm_model=llm,
+            reward_fn=reward_fn,
+            prompts=eval_prompts,
+            ground_truths=eval_gts,
+            eval_sampling_params=eval_sampling_params,
+            request_batch_size=request_batch_size,
+        )
+    s = summarize(rows)
+    return {
+        "eval/accuracy": s["answer_accuracy"],
+        "eval/format_rate": s["format_rate"],
+        "eval/avg_reward": s["avg_reward"],
+        "eval/n": s["n"],
+    }
 
 
 def filter_correct_sft_samples(data_path: str, out_path: str) -> Dict[str, Any]:
