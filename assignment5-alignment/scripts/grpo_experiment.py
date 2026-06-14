@@ -1,22 +1,29 @@
-import json
 import os
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "2,3")
+
+import json
 import time
 import random
 from pathlib import Path
-from typing import Any
 from enum import Enum
 
 import torch
 import typer
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from unittest.mock import patch
-from vllm import LLM, SamplingParams
-from vllm.model_executor import set_random_seed as vllm_set_random_seed
+from vllm import SamplingParams
 
 from cs336_alignment.sft_utils import tokenize_prompt_and_output, get_response_log_probs
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn, question_only_reward_fn
 from cs336_alignment.grpo import compute_group_normalized_rewards, grpo_microbatch_train_step, masked_mean
+from cs336_alignment.utils import (
+    init_vllm,
+    load_policy_into_vllm_instance,
+    build_prompts_and_gts,
+    eval_policy_with_vllm,
+)
 
 
 app = typer.Typer()
@@ -27,106 +34,6 @@ class LossType(str, Enum):
     reinforce_with_baseline = "reinforce_with_baseline"
     grpo_clip = "grpo_clip"
     grpo_no_clip = "grpo_no_clip"
-
-
-def init_vllm(model_id: str, device: str, seed: int, gpu_memory_utilization: float = 0.85):
-    vllm_set_random_seed(seed)
-    world_size_path = patch("torch.distributed.get_world_size", return_value=1)
-    profiling_patch = patch(
-        "vllm.worker.worker.Worker._assert_memory_footprint_increased_during_profiling",
-        return_value=None
-    )
-    with world_size_path, profiling_patch:
-        return LLM(
-            model=model_id,
-            device=device,
-            dtype=torch.bfloat16,
-            enable_prefix_caching=True,
-            gpu_memory_utilization=gpu_memory_utilization,
-        )
-
-
-def load_policy_into_vllm_instance(policy, llm: LLM):
-    state_dict = policy.state_dict()
-    llm_model = llm.llm_engine.model_executor.driver_worker.model_runner.model
-    llm_model.load_weights(state_dict.items())
-
-
-def load_math_jsonl(path: str, limit: int = 0, seed: int = 0) -> list[dict[str, Any]]:
-    data = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            data.append(json.loads(line))
-    if limit and limit > 0:
-        rnd = random.Random(seed)
-        rnd.shuffle(data)
-        data = data[:limit]
-    return data
-
-
-def build_prompts_and_gts(examples: list[dict[str, Any]], prompt_file: str) -> tuple[list[str], list[str]]:
-    template = Path(prompt_file).read_text(encoding="utf-8")
-    prompts, gts = [], []
-    dropped = 0
-
-    for ex in examples:
-        q = ex.get("problem") or ex.get("question") or ex.get("prompt")
-        gt = ex.get("answer") or ex.get("ground_truth") or ex.get("target")
-        if q is None or gt is None:
-            dropped += 1
-            continue
-        
-        if isinstance(gt, str) and gt.strip() == "":
-            dropped += 1
-            continue
-        prompts.append(template.format(question=q))
-        gts.append(gt)
-
-    if len(prompts) == 0:
-        raise RuntimeError("No valid examples found after filtering. Check dataset format.")
-
-    if dropped > 0:
-        print(f"[build_prompts_and_gts] dropped {dropped} examples with missing/empty fields")
-
-    return prompts, gts
-
-
-@torch.inference_mode()
-def eval_rewards_with_vllm(
-    llm: LLM,
-    val_prompts: list[str],
-    val_gts: list[str],
-    reward_fn,
-    max_examples: int,
-    temperature: float,
-    min_tokens: int,
-    max_tokens: int,
-    stop: list[str],
-) -> dict[str, float]:
-    prompts = val_prompts[:max_examples]
-    gts = val_gts[:max_examples]
-
-    sp = SamplingParams(
-        temperature=temperature,
-        min_tokens=min_tokens,
-        max_tokens=max_tokens,
-        stop=stop,
-    )
-    outs = llm.generate(prompts, sp)
-    # outs[i].outputs[0].text
-    total, fmt, ans = 0.0, 0.0, 0.0
-    for o, gt in zip(outs, gts):
-        resp = o.outputs[0].text
-        r = reward_fn(resp, gt)
-        total += float(r["reward"])
-        fmt += float(r["format_reward"])
-        ans += float(r["answer_reward"])
-    n = len(prompts)
-    return {
-        "val_reward": total / n,
-        "val_format_reward": fmt / n,
-        "val_answer_reward": ans / n,
-    }
 
 
 @app.command()
@@ -184,14 +91,12 @@ def main(
     log_path = Path(log_dir) / "train_log.jsonl"
 
     # -------- load data --------
-    train_examples = load_math_jsonl(train_path, limit=0, seed=seed)
-    val_examples = load_math_jsonl(val_path, limit=0, seed=seed)
-    train_prompts, train_gts = build_prompts_and_gts(train_examples, prompt_file)
-    val_prompts, val_gts = build_prompts_and_gts(val_examples, prompt_file)
+    train_prompts, train_gts = build_prompts_and_gts(train_path, prompt_file)
+    val_prompts, val_gts = build_prompts_and_gts(val_path, prompt_file)
 
     # -------- init models --------
     tokenizer = AutoTokenizer.from_pretrained(model_id)
-    policy = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.bfloat16).cuda()
+    policy = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.float16).cuda()
     policy.train()
 
     optimizer = torch.optim.AdamW(policy.parameters(), lr=learning_rate, weight_decay=0.0, betas=(0.9, 0.95))
@@ -368,19 +273,22 @@ def main(
 
                 # ===== periodic eval =====
                 if global_step % eval_interval == 0:
-                    # sync latest policy into vLLM before evaluation
-                    load_policy_into_vllm_instance(policy, llm)
-                    val_metrics = eval_rewards_with_vllm(
-                        llm=llm,
-                        val_prompts=val_prompts,
-                        val_gts=val_gts,
-                        reward_fn=r1_zero_reward_fn,
-                        max_examples=eval_max_examples,
+                    eval_sp = SamplingParams(
                         temperature=0.0,          # greedy decoding for eval
                         min_tokens=sampling_min_tokens,
                         max_tokens=sampling_max_tokens,
                         stop=[stop_at],
                     )
+                    # eval_policy_with_vllm syncs the policy into vLLM and leaves it in eval()
+                    val_metrics = eval_policy_with_vllm(
+                        policy=policy,
+                        llm=llm,
+                        eval_prompts=val_prompts[:eval_max_examples],
+                        eval_gts=val_gts[:eval_max_examples],
+                        eval_sampling_params=eval_sp,
+                        reward_fn=r1_zero_reward_fn,
+                    )
+                    policy.train()
                     with open(log_path, "a", encoding="utf-8") as f:
                         f.write(json.dumps({"global_step": global_step, **val_metrics}) + "\n")
 
