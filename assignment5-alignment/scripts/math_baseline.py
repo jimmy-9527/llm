@@ -7,16 +7,17 @@ import json
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any
 
 from vllm import LLM, SamplingParams
 
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
-from cs336_alignment.eval_utils import (
+from cs336_alignment.utils import (
     EvalRow,
     load_jsonl,
     read_text,
     format_r1_zero_prompt,
+    get_question,
+    get_ground_truth,
     evaluate_vllm,
     write_jsonl,
     summarize,
@@ -42,18 +43,6 @@ def main():
     examples = load_jsonl(args.data)
     if args.limit and args.limit > 0:
         examples = examples[: args.limit]
-
-    def get_question(ex: Dict[str, Any]) -> str:
-        for k in ["problem", "question", "prompt"]:
-            if k in ex and isinstance(ex[k], str):
-                return ex[k]
-        raise KeyError(f"Cannot find question field in example keys={list(ex.keys())}")
-
-    def get_ground_truth(ex: Dict[str, Any]) -> Any:
-        for k in ["answer", "ground_truth", "target"]:
-            if k in ex:
-                return ex[k]
-        raise KeyError(f"Cannot find answer field in example keys={list(ex.keys())}")
 
     prompts, gts = [], []
     for ex in examples:
