@@ -1,7 +1,9 @@
 import os
 os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "2,3")
+# Reduce allocator fragmentation on the (small) policy GPU; reclaims the
+# reserved-but-unallocated blocks that otherwise trigger OOM near capacity.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import json
 import time
@@ -67,6 +69,9 @@ def main(
     log_dir: str = "runs/grpo",
     save_interval: int = 50,
     stop_at: str = "</answer>",
+    # Per-token entropy logging needs two extra (B, T, vocab) tensors per
+    # microbatch; off by default to keep the policy GPU from OOMing.
+    log_token_entropy: bool = False,
 ):
     torch.manual_seed(seed)
     random.seed(seed)
@@ -95,13 +100,35 @@ def main(
     val_prompts, val_gts = build_prompts_and_gts(val_path, prompt_file)
 
     # -------- init models --------
+    # Pin the policy to an explicit device: init_vllm sets the *current* CUDA
+    # device to the vLLM GPU as a side effect, so relying on a bare .cuda()
+    # afterwards would scatter policy tensors onto the wrong device.
+    policy_device = torch.device("cuda:2")
     tokenizer = AutoTokenizer.from_pretrained(model_id)
-    policy = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.float16).cuda()
+    policy = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.float16).to(policy_device)
+    # Trade compute for memory: the policy GPU is small, so checkpoint
+    # activations to make room for the (B, T, vocab) logits spike during scoring.
+    policy.config.use_cache = False
+    policy.gradient_checkpointing_enable()
     policy.train()
 
-    optimizer = torch.optim.AdamW(policy.parameters(), lr=learning_rate, weight_decay=0.0, betas=(0.9, 0.95))
+    # Full-FT AdamW keeps two fp32-equivalent moments per param (~6GB for 1.5B),
+    # which alone overflows a 15GB card. 8-bit Adam stores those moments in int8
+    # (~1.5GB) while preserving Adam dynamics; fall back to torch AdamW if bnb is
+    # unavailable.
+    try:
+        from bitsandbytes.optim import PagedAdamW8bit
+        optimizer = PagedAdamW8bit(
+            policy.parameters(), lr=learning_rate, weight_decay=0.0, betas=(0.9, 0.95)
+        )
+        print("[optimizer] using bitsandbytes PagedAdamW8bit (8-bit optimizer states)")
+    except ImportError:
+        optimizer = torch.optim.AdamW(
+            policy.parameters(), lr=learning_rate, weight_decay=0.0, betas=(0.9, 0.95)
+        )
+        print("[optimizer] bitsandbytes unavailable; using torch.optim.AdamW (fp16 states)")
 
-    llm = init_vllm(model_id=model_id, device="cuda:1", seed=seed, gpu_memory_utilization=gpu_memory_utilization)
+    llm = init_vllm(model_id=model_id, device="cuda:3", seed=seed, gpu_memory_utilization=gpu_memory_utilization)
 
     load_policy_into_vllm_instance(policy, llm)
 
@@ -124,6 +151,9 @@ def main(
             max_tokens=sampling_max_tokens,
             n=group_size,
             stop=[stop_at],
+            # r1_zero_reward_fn requires the closing </answer> tag in the response;
+            # vLLM strips stop strings unless we keep them.
+            include_stop_str_in_output=True,
         )
         outs = llm.generate(batch_prompts, sp)
 
@@ -156,9 +186,9 @@ def main(
             tokenizer=tokenizer,
         )
         # toks: input_ids, labels, response_mask
-        input_ids = toks["input_ids"].cuda()
-        labels = toks["labels"].cuda()
-        response_mask = toks["response_mask"].cuda()
+        input_ids = toks["input_ids"].to(policy_device)
+        labels = toks["labels"].to(policy_device)
+        response_mask = toks["response_mask"].to(policy_device)
 
         # ========== 5) (optional) old_log_probs for off-policy grpo_clip ==========
         old_log_probs = None
@@ -179,13 +209,13 @@ def main(
         perm = torch.randperm(rollout_batch_size, device=input_ids.device)
 
         # move reward/advantage to GPU and reorder according to perm
-        advantages_gpu = advantages.cuda()[perm].unsqueeze(-1)      # (B, 1)
-        raw_rewards_gpu = raw_rewards.cuda()[perm].unsqueeze(-1)    # (B, 1)
+        advantages_gpu = advantages.to(policy_device)[perm].unsqueeze(-1)      # (B, 1)
+        raw_rewards_gpu = raw_rewards.to(policy_device)[perm].unsqueeze(-1)    # (B, 1)
         input_ids = input_ids[perm]
         labels = labels[perm]
         response_mask = response_mask[perm]
         if old_log_probs is not None:
-            old_log_probs = old_log_probs.cuda()[perm]
+            old_log_probs = old_log_probs.to(policy_device)[perm]
 
         # actual optimization
         policy.train()
@@ -223,10 +253,9 @@ def main(
                         model=policy,
                         input_ids=micro_input_ids,
                         labels=micro_labels,
-                        return_token_entropy=True,
+                        return_token_entropy=log_token_entropy,
                     )
                     policy_log_probs = scored["log_probs"]          # (microB, T)
-                    token_entropy = scored["token_entropy"]         # (microB, T)
 
                     # training step (includes masked_mean + /grad_acc_steps scaling + backward)
                     micro_loss, meta = grpo_microbatch_train_step(
@@ -241,9 +270,10 @@ def main(
                     )
 
                     loss_accum += float(micro_loss.detach().cpu())
-                    # average token entropy (only over response tokens)
-                    ent = masked_mean(token_entropy.detach(), micro_mask, dim=None)
-                    entropies.append(float(ent.cpu()))
+                    # average token entropy (only over response tokens), if enabled
+                    if log_token_entropy:
+                        ent = masked_mean(scored["token_entropy"].detach(), micro_mask, dim=None)
+                        entropies.append(float(ent.cpu()))
 
                 # gradient clipping + step
                 grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)
@@ -261,9 +291,10 @@ def main(
                     "grad_norm": float(grad_norm.detach().cpu()),
                     "train_reward": float(mb_raw.mean().detach().cpu()),
                     "train_adv": float(mb_adv.mean().detach().cpu()),
-                    "token_entropy": sum(entropies) / max(1, len(entropies)),
                     "wall_time_sec": time.time() - t0,
                 }
+                if entropies:
+                    log_obj["token_entropy"] = sum(entropies) / len(entropies)
                 # clip fraction (if recorded in grpo_clip metadata)
                 if "clip_fraction" in meta:
                     log_obj["clip_fraction"] = float(meta["clip_fraction"].detach().cpu())
@@ -278,6 +309,7 @@ def main(
                         min_tokens=sampling_min_tokens,
                         max_tokens=sampling_max_tokens,
                         stop=[stop_at],
+                        include_stop_str_in_output=True,
                     )
                     # eval_policy_with_vllm syncs the policy into vLLM and leaves it in eval()
                     val_metrics = eval_policy_with_vllm(
