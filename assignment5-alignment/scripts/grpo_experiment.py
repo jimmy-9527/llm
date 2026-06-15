@@ -103,7 +103,7 @@ def main(
     # Pin the policy to an explicit device: init_vllm sets the *current* CUDA
     # device to the vLLM GPU as a side effect, so relying on a bare .cuda()
     # afterwards would scatter policy tensors onto the wrong device.
-    policy_device = torch.device("cuda:2")
+    policy_device = torch.device("cuda:0")
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     policy = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.float16).to(policy_device)
     # Trade compute for memory: the policy GPU is small, so checkpoint
@@ -128,7 +128,7 @@ def main(
         )
         print("[optimizer] bitsandbytes unavailable; using torch.optim.AdamW (fp16 states)")
 
-    llm = init_vllm(model_id=model_id, device="cuda:3", seed=seed, gpu_memory_utilization=gpu_memory_utilization)
+    llm = init_vllm(model_id=model_id, device="cuda:1", seed=seed, gpu_memory_utilization=gpu_memory_utilization)
 
     load_policy_into_vllm_instance(policy, llm)
 
