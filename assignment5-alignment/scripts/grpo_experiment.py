@@ -283,6 +283,7 @@ def main(
 
                 # ===== logging =====
                 log_obj = {
+                    "learning_rate": learning_rate,
                     "grpo_step": grpo_step,
                     "global_step": global_step,
                     "epoch": epoch,
@@ -322,7 +323,7 @@ def main(
                     )
                     policy.train()
                     with open(log_path, "a", encoding="utf-8") as f:
-                        f.write(json.dumps({"global_step": global_step, **val_metrics}) + "\n")
+                        f.write(json.dumps({"learning_rate": learning_rate, "global_step": global_step, **val_metrics}) + "\n")
 
                 # ===== periodic save =====
                 if global_step % save_interval == 0:

@@ -6,7 +6,7 @@ MODEL_ID="${MODEL_ID:-data/models/Qwen2.5-Math-1.5B}"
 TRAIN_PATH="${TRAIN_PATH:-data/MATH/train.jsonl}"
 VAL_PATH="${VAL_PATH:-data/MATH/validation.jsonl}"
 PROMPT_FILE="${PROMPT_FILE:-cs336_alignment/prompts/r1_zero.prompt}"
-LOG_DIR="${LOG_DIR:-runs/grpo_lr_sweep}"
+LOG_DIR="${LOG_DIR:-runs/grpo_lr_sweep_v2}"
 
 # ====== sweep grid ======
 LRS=(3e-6 1e-5 3e-5 1e-4)
@@ -51,12 +51,14 @@ echo
 for lr in "${LRS[@]}"; do
   echo "---- Running lr=${lr} ----"
 
+  run_dir="${LOG_DIR}/lr_${lr}"
+
   cmd=(uv run python scripts/grpo_experiment.py
     --model-id "${MODEL_ID}"
     --train-path "${TRAIN_PATH}"
     --val-path "${VAL_PATH}"
     --prompt-file "${PROMPT_FILE}"
-    --log-dir "${LOG_DIR}"
+    --log-dir "${run_dir}"
     --seed "${SEED}"
     --learning-rate "${lr}"
     --n-grpo-steps "${N_GRPO_STEPS}"
