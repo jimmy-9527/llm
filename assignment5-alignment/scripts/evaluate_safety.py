@@ -11,6 +11,10 @@ python scripts/evaluate_safety.py \
     --output-path <path_to_write_output.jsonl>
 ```
 """
+import os
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
 import argparse
 import json
 import logging
