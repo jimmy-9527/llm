@@ -69,6 +69,9 @@ def main(
     log_dir: str = "runs/grpo",
     save_interval: int = 50,
     stop_at: str = "</answer>",
+    # GPU placement: policy on one card, vLLM on another (single-process, 2 GPUs).
+    policy_device_str: str = "cuda:0",
+    vllm_device_str: str = "cuda:1",
     # Per-token entropy logging needs two extra (B, T, vocab) tensors per
     # microbatch; off by default to keep the policy GPU from OOMing.
     log_token_entropy: bool = False,
@@ -103,7 +106,7 @@ def main(
     # Pin the policy to an explicit device: init_vllm sets the *current* CUDA
     # device to the vLLM GPU as a side effect, so relying on a bare .cuda()
     # afterwards would scatter policy tensors onto the wrong device.
-    policy_device = torch.device("cuda:0")
+    policy_device = torch.device(policy_device_str)
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     policy = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.float16).to(policy_device)
     # Trade compute for memory: the policy GPU is small, so checkpoint
@@ -128,7 +131,7 @@ def main(
         )
         print("[optimizer] bitsandbytes unavailable; using torch.optim.AdamW (fp16 states)")
 
-    llm = init_vllm(model_id=model_id, device="cuda:1", seed=seed, gpu_memory_utilization=gpu_memory_utilization)
+    llm = init_vllm(model_id=model_id, device=vllm_device_str, seed=seed, gpu_memory_utilization=gpu_memory_utilization)
 
     load_policy_into_vllm_instance(policy, llm)
 
