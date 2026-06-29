@@ -28,6 +28,14 @@ CLIPRANGE="${CLIPRANGE:-0.2}"
 N_GRPO_STEPS="${N_GRPO_STEPS:-40}"
 EVAL_INTERVAL="${EVAL_INTERVAL:-5}"
 EVAL_MAX_EXAMPLES="${EVAL_MAX_EXAMPLES:-512}"
+# Coarse sweep wants eval curves, not checkpoints. Default high to skip saving
+# (grpo_clip steps global_step per optimizer update, so cells run well past
+# N_GRPO_STEPS and would otherwise emit >100GB of checkpoints across the grid).
+SAVE_INTERVAL="${SAVE_INTERVAL:-100000}"
+
+# GPU placement. Default to cuda:2/cuda:3 (cuda:0/1 are held by another job).
+POLICY_DEVICE="${POLICY_DEVICE:-cuda:2}"
+VLLM_DEVICE="${VLLM_DEVICE:-cuda:3}"
 
 # Sampling (can shrink for sanity)
 SAMPLING_TEMP="${SAMPLING_TEMP:-1.0}"
@@ -39,10 +47,7 @@ SAMPLING_MAX_TOKENS="${SAMPLING_MAX_TOKENS:-1024}"
 MICRO_BS="${MICRO_BS:-2}"
 
 # Use the best choices from prior ablations (override via env vars)
-# (These flags may or may not exist in your script; keep if you added them.)
 USE_STD_NORM="${USE_STD_NORM:-1}"              # 1 => add --use-std-normalization
-LENGTH_NORM="${LENGTH_NORM:-masked_mean}"      # masked_mean or masked_normalize
-CONSTANT_NORMALIZER="${CONSTANT_NORMALIZER:-1024}"
 
 # Output
 LOG_DIR="${LOG_DIR:-runs/grpo_offpolicy_coarse}"
@@ -81,12 +86,14 @@ for E in "${EPOCHS_LIST[@]}"; do
 
     echo "---- Run epochs=${E} train_bs=${TB} grad_acc=${GA} updates/rollout=${TOTAL_UPDATES} ----"
 
+    run_dir="${LOG_DIR}/e${E}_tb${TB}"
+
     cmd=(uv run python scripts/grpo_experiment.py
       --model-id "${MODEL_ID}"
       --train-path "${TRAIN_PATH}"
       --val-path "${VAL_PATH}"
       --prompt-file "${PROMPT_FILE}"
-      --log-dir "${LOG_DIR}"
+      --log-dir "${run_dir}"
       --seed "${SEED}"
 
       --loss-type "${LOSS_TYPE}"
@@ -106,9 +113,10 @@ for E in "${EPOCHS_LIST[@]}"; do
 
       --eval-interval "${EVAL_INTERVAL}"
       --eval-max-examples "${EVAL_MAX_EXAMPLES}"
+      --save-interval "${SAVE_INTERVAL}"
 
-      # helpful tag so you can grep logs later (if your script supports it; optional)
-      # --run-name "coarse_e${E}_tb${TB}_u${TOTAL_UPDATES}"
+      --policy-device-str "${POLICY_DEVICE}"
+      --vllm-device-str "${VLLM_DEVICE}"
     )
 
     if [[ "${USE_STD_NORM}" == "1" ]]; then

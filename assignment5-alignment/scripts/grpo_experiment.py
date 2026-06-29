@@ -196,15 +196,22 @@ def main(
         # ========== 5) (optional) old_log_probs for off-policy grpo_clip ==========
         old_log_probs = None
         if loss_type == "grpo_clip" or epochs_per_rollout_batch > 1 or train_batch_size != rollout_batch_size:
-            # typical off-policy case: multiple epochs / multiple updates
+            # typical off-policy case: multiple epochs / multiple updates.
+            # Score in microbatches: a single forward over the full rollout batch
+            # materializes a (B, T, vocab) logits tensor that OOMs the 15GB policy
+            # GPU. Chunking is numerically identical (no grad here).
             with torch.inference_mode():
-                scored_old = get_response_log_probs(
-                    model=policy,
-                    input_ids=input_ids,
-                    labels=labels,
-                    return_token_entropy=False,
-                )
-                old_log_probs = scored_old["log_probs"].detach()  # (B, T)
+                old_chunks = []
+                for ms in range(0, rollout_batch_size, micro_train_batch_size):
+                    me = ms + micro_train_batch_size
+                    scored_old = get_response_log_probs(
+                        model=policy,
+                        input_ids=input_ids[ms:me],
+                        labels=labels[ms:me],
+                        return_token_entropy=False,
+                    )
+                    old_chunks.append(scored_old["log_probs"].detach())
+                old_log_probs = torch.cat(old_chunks, dim=0)  # (B, T)
                 # disable gradients for old policy logprobs
                 old_log_probs.requires_grad_(False)
         
