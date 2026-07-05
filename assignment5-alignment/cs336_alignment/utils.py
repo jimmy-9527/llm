@@ -1,7 +1,7 @@
 import json
 import os
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, List, Dict, Any, Optional
@@ -199,11 +199,15 @@ def evaluate_vllm(
     return rows
 
 
-def write_jsonl(path: str, rows: List[EvalRow]) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+def write_jsonl(path, rows) -> None:
+    """Write an iterable of rows as JSONL. Rows may be dataclasses or plain dicts."""
+    parent = os.path.dirname(str(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         for r in rows:
-            f.write(json.dumps(asdict(r), ensure_ascii=False) + "\n")
+            obj = asdict(r) if is_dataclass(r) else r
+            f.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
 
 def summarize(rows: List[EvalRow]) -> Dict[str, Any]:
@@ -290,29 +294,32 @@ def collate_fn(batch, tokenizer):
     return tokenize_prompt_and_output(prompts, outputs, tokenizer)
 
 
-def log_event(
-    log_path: Path,
-    step: int,
-    micro_idx: int,
-    opt_step: int,
-    event: Dict[str, Any],
-    *,
-    also_print: bool = True,
-) -> None:
-    payload = {
-        "ts": datetime.now().isoformat(timespec="seconds"),
-        "time": time.time(),
-        "step": step,
-        "micro_idx": micro_idx,
-        "opt_step": opt_step,
-        **event,
-    }
-    with open(log_path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
-        f.flush()
+def make_logger(log_path: Path):
+    """Return a JSONL event logger bound to ``log_path``.
 
-    if also_print:
-        if "msg" in event:
-            print(event["msg"])
-        else:
-            print(payload)
+    The returned callable writes one JSON line per call: a timestamp, any extra
+    top-level ``fields`` (e.g. step counters), then the ``event`` dict. If the
+    event carries a ``msg`` it is echoed to stdout when ``also_print`` is set.
+
+    Usage:
+        log = make_logger(run_dir / "log.jsonl")
+        log({"type": "eval", "msg": "..."})                       # bare event
+        log({"type": "train_loss", ...}, step=step, opt_step=opt) # extra columns
+    """
+    log_path = Path(log_path)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def log(event: Dict[str, Any], *, also_print: bool = True, **fields: Any) -> None:
+        payload = {
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "time": time.time(),
+            **fields,
+            **event,
+        }
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            f.flush()
+        if also_print:
+            print(event["msg"] if "msg" in event else payload)
+
+    return log

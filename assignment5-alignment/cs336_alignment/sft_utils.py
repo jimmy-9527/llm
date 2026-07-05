@@ -92,14 +92,33 @@ def compute_entropy(logits: torch.Tensor) -> torch.Tensor:
     if logits.ndim < 1:
         raise ValueError(f"logits must have at least 1 dim, got {tuple(logits.shape)}")
 
-    # log_probs = logits - logsumexp(logits)
-    log_z = torch.logsumexp(logits, dim=-1, keepdim=True)   # (B, T, 1)
-    log_probs = logits - log_z                              # (B, T, V)
-    probs = torch.exp(log_probs)                            # (B, T, V)
+    # H(p) = -sum_v p(v) log p(v)
+    #      = logsumexp(logits) - sum_v softmax(logits)_v * logits_v
+    #
+    # Even with this identity, a naive one-shot evaluation transiently holds three
+    # full-vocab (B, T, V) tensors at once (`logits`, `softmax(logits)`, and the
+    # `probs * logits` product). With a ~152k-token vocab that spike overflowed a
+    # 15GB T4 during training. We therefore stream over rows in fixed-size chunks
+    # so the peak extra allocation is bounded by `chunk_rows * V`, independent of
+    # how large B and T are.
+    orig_shape = logits.shape[:-1]                          # (B, T)
+    V = logits.shape[-1]
+    flat = logits.reshape(-1, V)                            # (N, V)
+    N = flat.shape[0]
 
-    # H(p) = - sum_v p(v) * log p(v)
-    entropy = -(probs * log_probs).sum(dim=-1)              # (B, T)
-    return entropy
+    # Cap the transient float32 buffer to ~64M elements (~256MB) per chunk.
+    max_elems = 1 << 26
+    chunk_rows = max(1, min(N, max_elems // max(V, 1)))
+
+    out = torch.empty(N, dtype=torch.float32, device=logits.device)
+    for start in range(0, N, chunk_rows):
+        block = flat[start:start + chunk_rows].float()      # (r, V)
+        log_z = torch.logsumexp(block, dim=-1)              # (r,)
+        probs = torch.softmax(block, dim=-1)                # (r, V)
+        probs.mul_(block)                                   # in-place: no extra (r, V) copy
+        out[start:start + chunk_rows] = log_z - probs.sum(dim=-1)
+
+    return out.reshape(orig_shape)                          # (B, T)
 
 
 def get_response_log_probs(
@@ -133,19 +152,26 @@ def get_response_log_probs(
 
     # forward
     logits = model(input_ids=input_ids).logits  # (B, T, V)
+    B, T, V = logits.shape
 
-    # stable log-probs over vocab
-    log_probs_vocab = F.log_softmax(logits, dim=-1)  # (B, T, V)
-
-    # gather log p(label_t | prefix) for each position
-    # labels: (B, T) -> (B, T, 1) for gather
-    gathered = torch.gather(log_probs_vocab, dim=-1, index=labels.unsqueeze(-1))  # (B, T, 1)
-    token_log_probs = gathered.squeeze(-1)  # (B, T)
+    # Per-token log p(label_t | prefix). Use the fused cross-entropy kernel
+    # (mathematically -log_softmax followed by a gather) instead of materializing
+    # the full (B, T, V) log-softmax tensor and retaining it for backward; this
+    # keeps peak memory near the logits themselves on a large-vocab model.
+    token_log_probs = -F.cross_entropy(
+        logits.reshape(-1, V),
+        labels.reshape(-1),
+        reduction="none",
+    ).reshape(B, T)  # (B, T)
 
     out: Dict[str, torch.Tensor] = {"log_probs": token_log_probs}
 
     if return_token_entropy:
-        out["token_entropy"] = compute_entropy(logits)  # (B, T)
+        # Diagnostic only (all callers detach it), so compute it without building
+        # the autograd graph: the softmax temporaries are freed immediately
+        # instead of being held until backward.
+        with torch.no_grad():
+            out["token_entropy"] = compute_entropy(logits)  # (B, T)
 
     return out
 

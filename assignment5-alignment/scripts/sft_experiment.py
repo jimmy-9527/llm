@@ -15,7 +15,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from cs336_alignment.utils import (
     load_jsonl, init_vllm, build_prompts_and_gts,
-    filter_correct_sft_samples, collate_fn, log_event,
+    filter_correct_sft_samples, collate_fn, make_logger,
     eval_policy_with_vllm,
 )
 from cs336_alignment.sft_utils import get_response_log_probs, sft_microbatch_train_step
@@ -24,12 +24,24 @@ from vllm import SamplingParams
 
 
 class SFTDataset(Dataset):
-    def __init__(self, path: str, limit: int = 0, seed: int = 0):
-        self.data = load_jsonl(path)
-        if limit and limit > 0:
-            rnd = random.Random(seed)
-            rnd.shuffle(self.data)
-            self.data = self.data[:limit]
+    """Prompt/response pairs for SFT, from a JSONL path or an in-memory list.
+
+    Provide exactly one of:
+      - ``path``: load a JSONL file, optionally subsampled to ``limit`` items.
+      - ``items``: already-loaded dicts (e.g. EI-kept rollouts).
+    Each item must have ``prompt`` and ``response`` fields.
+    """
+    def __init__(self, path: str = None, limit: int = 0, seed: int = 0, *, items=None):
+        if items is not None:
+            self.data = list(items)
+        elif path is not None:
+            self.data = load_jsonl(path)
+            if limit and limit > 0:
+                rnd = random.Random(seed)
+                rnd.shuffle(self.data)
+                self.data = self.data[:limit]
+        else:
+            raise ValueError("SFTDataset requires either `path` or `items`")
 
     def __len__(self):
         return len(self.data)
@@ -37,7 +49,82 @@ class SFTDataset(Dataset):
     def __getitem__(self, idx):
         ex = self.data[idx]
         return ex["prompt"], ex["response"], ex
-    
+
+
+def load_policy_and_tokenizer(model_id: str, device: str, dtype=torch.bfloat16):
+    """Load a tokenizer + causal-LM policy for full SFT on ``device``.
+
+    NOTE: train in bf16, not fp16. Pure-fp16 full fine-tuning is unstable here:
+    AdamW eps=1e-8 underflows to 0 in fp16 and fp16 log-softmax over the 151k
+    vocab overflows, producing NaN losses within a few steps. bf16 has fp32's
+    exponent range (no overflow, eps representable) and is supported on the T4.
+    """
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    policy = AutoModelForCausalLM.from_pretrained(
+        model_id,
+        torch_dtype=dtype,
+        attn_implementation="sdpa",
+    ).to(device)
+    policy.gradient_checkpointing_enable()
+    policy.train()
+    return tokenizer, policy
+
+
+def make_sft_optimizer(policy, lr: float):
+    """Single-tensor AdamW (foreach/fused disabled), shared by the SFT and EI loops."""
+    return torch.optim.AdamW(policy.parameters(), lr=lr, foreach=False, fused=False)
+
+
+def clip_and_step(policy, opt, max_norm: float = 1.0):
+    """Grad-clip, optimizer step, then zero grads. Shared by the SFT and EI loops."""
+    torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm)
+    opt.step()
+    opt.zero_grad(set_to_none=True)
+
+
+def sft_forward_backward(
+    policy, batch, device, *, grad_acc_steps, normalize_constant=1.0, return_entropy=False
+):
+    """Run one SFT micro-batch: move to ``device``, forward, masked-NLL backward.
+
+    ``sft_microbatch_train_step`` scales the loss by 1/grad_acc_steps and calls
+    backward() internally, so the caller only owns optimizer stepping.
+
+    normalize_constant: divisor for the summed per-token NLL. Pass a float (e.g.
+      1.0), or ``None`` to normalize by the number of response tokens in the batch
+      (a per-token-mean NLL, which keeps gradients O(1) rather than O(resp_len)).
+    return_entropy: if True, also return the response-masked mean token entropy
+      (for logging); otherwise the second return value is None.
+
+    Returns ``(loss, avg_entropy_or_None)``.
+    """
+    input_ids = batch["input_ids"].to(device)
+    labels = batch["labels"].to(device)
+    response_mask = batch["response_mask"].to(device)
+
+    out = get_response_log_probs(
+        policy, input_ids, labels, return_token_entropy=return_entropy
+    )
+
+    if normalize_constant is None:
+        normalize_constant = float(torch.clamp(response_mask.sum(), min=1.0).detach().cpu())
+
+    loss, _ = sft_microbatch_train_step(
+        policy_log_probs=out["log_probs"],
+        response_mask=response_mask,
+        gradient_accumulation_steps=grad_acc_steps,
+        normalize_constant=normalize_constant,
+    )
+
+    avg_entropy = None
+    if return_entropy:
+        with torch.no_grad():
+            te = out["token_entropy"]
+            m = response_mask.to(te.dtype)
+            denom = torch.clamp(m.sum(), min=1.0)
+            avg_entropy = float((te * m).sum().cpu() / denom.cpu())
+
+    return loss, avg_entropy
 
 
 
@@ -67,7 +154,7 @@ def main():
     # logging
     run_dir = Path(args.out_dir) / f"samples{args.train_samples or 'full'}_{'filtered' if args.filter_correct else 'all'}"
     run_dir.mkdir(parents=True, exist_ok=True)
-    log_path = run_dir / "log.jsonl"
+    log_event = make_logger(run_dir / "log.jsonl")
 
     opt_step = 0  # counts optimizer updates
     step = 0
@@ -78,14 +165,7 @@ def main():
     random.seed(args.seed)
 
     # tokenizer/model on train device
-    tokenizer = AutoTokenizer.from_pretrained(args.model_id)
-    policy = AutoModelForCausalLM.from_pretrained(
-        args.model_id,
-        torch_dtype=torch.float16,
-        attn_implementation="sdpa",
-    ).to(args.train_device)
-    policy.gradient_checkpointing_enable()
-    policy.train()
+    tokenizer, policy = load_policy_and_tokenizer(args.model_id, args.train_device)
 
     # vLLM on eval device
     llm = init_vllm(args.model_id, device=args.vllm_device, seed=args.seed)
@@ -107,7 +187,7 @@ def main():
     if args.filter_correct:
         filtered_path = str(Path(args.out_dir) / "filtered_sft.jsonl")
         stats = filter_correct_sft_samples(args.sft_path, filtered_path)
-        log_event(log_path, step, micro_idx, opt_step, {"type": "filter_stats", "stats": stats, "msg": f"Filter stats: {stats}"})
+        log_event({"type": "filter_stats", "stats": stats, "msg": f"Filter stats: {stats}"}, step=step, micro_idx=micro_idx, opt_step=opt_step)
         data_path = filtered_path
 
     dataset = SFTDataset(data_path, limit=args.train_samples, seed=args.seed)
@@ -119,7 +199,7 @@ def main():
         drop_last=True,
     )
 
-    opt = torch.optim.AdamW(policy.parameters(), lr=args.lr, foreach=False, fused=False)
+    opt = make_sft_optimizer(policy, args.lr)
 
     # training loop
     opt.zero_grad(set_to_none=True)
@@ -129,30 +209,18 @@ def main():
             step += 1
             micro_idx += 1
 
-            input_ids = batch["input_ids"].to(args.train_device)
-            labels = batch["labels"].to(args.train_device)
-            response_mask = batch["response_mask"].to(args.train_device)
-
-            # get per-token log_probs (B, T)
-            out = get_response_log_probs(policy, input_ids, labels, return_token_entropy=False)
-            policy_log_probs = out["log_probs"]            
-
-            # microbatch train step: does backward inside
-            loss, meta = sft_microbatch_train_step(
-                policy_log_probs=policy_log_probs,
-                response_mask=response_mask,
-                gradient_accumulation_steps=args.grad_acc_steps,
-                normalize_constant=1.0,
+            # forward + masked-NLL backward (backward happens inside)
+            loss, _ = sft_forward_backward(
+                policy, batch, args.train_device,
+                grad_acc_steps=args.grad_acc_steps, normalize_constant=1.0,
             )
 
             # optimizer step each grad_acc_steps
             if micro_idx % args.grad_acc_steps == 0:
-                torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
-                opt.step()
-                opt.zero_grad(set_to_none=True)
+                clip_and_step(policy, opt)
                 opt_step += 1
                 if opt_step % 10 == 0:
-                    log_event(log_path, step, micro_idx, opt_step, {"type": "train_loss", "loss": float(loss.detach())}, also_print=False)
+                    log_event({"type": "train_loss", "loss": float(loss.detach())}, step=step, micro_idx=micro_idx, opt_step=opt_step, also_print=False)
 
             # periodic eval
             if step % args.eval_interval == 0:
@@ -164,8 +232,8 @@ def main():
                     eval_sampling_params=eval_sampling_params,
                     request_batch_size=64,
                 )
-                log_event(log_path, step, micro_idx, opt_step, {"type": "eval_metrics", "loss": float(loss.detach()), "metrics": metrics,
-                        "msg": f"[step={step}] loss={float(loss.detach()):.4f} {metrics}"})
+                log_event({"type": "eval_metrics", "loss": float(loss.detach()), "metrics": metrics,
+                        "msg": f"[step={step}] loss={float(loss.detach()):.4f} {metrics}"}, step=step, micro_idx=micro_idx, opt_step=opt_step)
                 policy.train()
 
             if step >= args.max_steps:
@@ -176,7 +244,7 @@ def main():
     # save
     policy.save_pretrained(str(run_dir))
     tokenizer.save_pretrained(str(run_dir))
-    log_event(log_path, step, micro_idx, opt_step, {"type": "save", "out_dir": str(run_dir), "msg": f"Saved: {run_dir}"})
+    log_event({"type": "save", "out_dir": str(run_dir), "msg": f"Saved: {run_dir}"}, step=step, micro_idx=micro_idx, opt_step=opt_step)
 
 
 # uv run python scripts/sft_experiment.py \
